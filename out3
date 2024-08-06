@@ -1,0 +1,547 @@
+   Compiling kademlia_mvp v0.1.0 (/home/jubajuba/code/rust/study_plan/scratch/kademlia_mvp)
+warning: unused import: `DeserializeOwned`
+ --> src/ex4c_refactoredTTL.rs:4:17
+  |
+4 | use serde::de::{DeserializeOwned, DeserializeSeed};
+  |                 ^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `std::fs::File`
+ --> src/ex4c_refactoredTTL.rs:7:5
+  |
+7 | use std::fs::File;
+  |     ^^^^^^^^^^^^^
+
+warning: unused imports: `BufWriter` and `self`
+  --> src/ex4c_refactoredTTL.rs:10:15
+   |
+10 | use std::io::{self, BufWriter, Write};
+   |               ^^^^  ^^^^^^^^^
+
+error[E0277]: `V` doesn't implement `Debug`
+   --> src/ex4c_refactoredTTL.rs:144:12
+    |
+144 | impl<K, V> KeyValueStoreTTL<K, V>
+    |            ^^^^^^^^^^^^^^^^^^^^^^ `V` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+note: required by a bound in `KeyValueStoreTTL`
+   --> src/ex4c_refactoredTTL.rs:123:30
+    |
+120 | pub struct KeyValueStoreTTL<K, V>
+    |            ---------------- required by a bound in this struct
+...
+123 |     V: Clone + Send + Sync + Debug,
+    |                              ^^^^^ required by this bound in `KeyValueStoreTTL`
+help: consider further restricting this bound
+    |
+155 |     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + std::fmt::Debug,
+    |                                                                              +++++++++++++++++
+
+error[E0277]: `K` doesn't implement `Debug`
+   --> src/ex4c_refactoredTTL.rs:362:21
+    |
+362 | impl<K, V> Drop for KeyValueStoreTTL<K, V>
+    |                     ^^^^^^^^^^^^^^^^^^^^^^ `K` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+note: required by a bound in `KeyValueStoreTTL`
+   --> src/ex4c_refactoredTTL.rs:122:42
+    |
+120 | pub struct KeyValueStoreTTL<K, V>
+    |            ---------------- required by a bound in this struct
+121 | where
+122 |     K: Eq + Hash + Clone + Send + Sync + Debug,
+    |                                          ^^^^^ required by this bound in `KeyValueStoreTTL`
+help: consider further restricting this bound
+    |
+364 |     K: Eq + Hash + Clone + Send + Sync + std::fmt::Debug,
+    |                                        +++++++++++++++++
+
+error[E0277]: `V` doesn't implement `Debug`
+   --> src/ex4c_refactoredTTL.rs:362:21
+    |
+362 | impl<K, V> Drop for KeyValueStoreTTL<K, V>
+    |                     ^^^^^^^^^^^^^^^^^^^^^^ `V` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+note: required by a bound in `KeyValueStoreTTL`
+   --> src/ex4c_refactoredTTL.rs:123:30
+    |
+120 | pub struct KeyValueStoreTTL<K, V>
+    |            ---------------- required by a bound in this struct
+...
+123 |     V: Clone + Send + Sync + Debug,
+    |                              ^^^^^ required by this bound in `KeyValueStoreTTL`
+help: consider further restricting this bound
+    |
+365 |     V: Clone + Send + Sync + std::fmt::Debug,
+    |                            +++++++++++++++++
+
+error[E0277]: `V` doesn't implement `Debug`
+   --> src/ex4c_refactoredTTL.rs:157:21
+    |
+157 |     pub fn new() -> Self {
+    |                     ^^^^ `V` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+note: required by a bound in `KeyValueStoreTTL`
+   --> src/ex4c_refactoredTTL.rs:123:30
+    |
+120 | pub struct KeyValueStoreTTL<K, V>
+    |            ---------------- required by a bound in this struct
+...
+123 |     V: Clone + Send + Sync + Debug,
+    |                              ^^^^^ required by this bound in `KeyValueStoreTTL`
+help: consider further restricting this bound
+    |
+155 |     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + std::fmt::Debug,
+    |                                                                              +++++++++++++++++
+
+error[E0277]: `V` doesn't implement `Debug`
+   --> src/ex4c_refactoredTTL.rs:168:29
+    |
+168 |     pub fn create_snapshot(&self) -> Result<Vec<u8>> {
+    |                             ^^^^ `V` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+note: required by a bound in `KeyValueStoreTTL`
+   --> src/ex4c_refactoredTTL.rs:123:30
+    |
+120 | pub struct KeyValueStoreTTL<K, V>
+    |            ---------------- required by a bound in this struct
+...
+123 |     V: Clone + Send + Sync + Debug,
+    |                              ^^^^^ required by this bound in `KeyValueStoreTTL`
+help: consider further restricting this bound
+    |
+155 |     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + std::fmt::Debug,
+    |                                                                              +++++++++++++++++
+
+error[E0277]: `V` doesn't implement `Debug`
+   --> src/ex4c_refactoredTTL.rs:186:35
+    |
+186 |     pub fn restore_from_snapshot(&self, data: &[u8]) -> Result<()> {
+    |                                   ^^^^ `V` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+note: required by a bound in `KeyValueStoreTTL`
+   --> src/ex4c_refactoredTTL.rs:123:30
+    |
+120 | pub struct KeyValueStoreTTL<K, V>
+    |            ---------------- required by a bound in this struct
+...
+123 |     V: Clone + Send + Sync + Debug,
+    |                              ^^^^^ required by this bound in `KeyValueStoreTTL`
+help: consider further restricting this bound
+    |
+155 |     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + std::fmt::Debug,
+    |                                                                              +++++++++++++++++
+
+error[E0277]: `V` doesn't implement `Debug`
+   --> src/ex4c_refactoredTTL.rs:203:35
+    |
+203 |     pub fn save_snapshot_to_file(&self, p: &Path) -> Result<()> {
+    |                                   ^^^^ `V` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+note: required by a bound in `KeyValueStoreTTL`
+   --> src/ex4c_refactoredTTL.rs:123:30
+    |
+120 | pub struct KeyValueStoreTTL<K, V>
+    |            ---------------- required by a bound in this struct
+...
+123 |     V: Clone + Send + Sync + Debug,
+    |                              ^^^^^ required by this bound in `KeyValueStoreTTL`
+help: consider further restricting this bound
+    |
+155 |     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + std::fmt::Debug,
+    |                                                                              +++++++++++++++++
+
+error[E0277]: `V` doesn't implement `Debug`
+   --> src/ex4c_refactoredTTL.rs:222:37
+    |
+222 |     pub fn load_snapshot_from_file(&self, path: &Path) -> Result<()> {
+    |                                     ^^^^ `V` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+note: required by a bound in `KeyValueStoreTTL`
+   --> src/ex4c_refactoredTTL.rs:123:30
+    |
+120 | pub struct KeyValueStoreTTL<K, V>
+    |            ---------------- required by a bound in this struct
+...
+123 |     V: Clone + Send + Sync + Debug,
+    |                              ^^^^^ required by this bound in `KeyValueStoreTTL`
+help: consider further restricting this bound
+    |
+155 |     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + std::fmt::Debug,
+    |                                                                              +++++++++++++++++
+
+error[E0277]: `V` doesn't implement `Debug`
+   --> src/ex4c_refactoredTTL.rs:230:35
+    |
+230 |     pub fn start_snapshot_thread(&self, interval: Duration, path: PathBuf) -> Result<()> {
+    |                                   ^^^^ `V` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+note: required by a bound in `KeyValueStoreTTL`
+   --> src/ex4c_refactoredTTL.rs:123:30
+    |
+120 | pub struct KeyValueStoreTTL<K, V>
+    |            ---------------- required by a bound in this struct
+...
+123 |     V: Clone + Send + Sync + Debug,
+    |                              ^^^^^ required by this bound in `KeyValueStoreTTL`
+help: consider further restricting this bound
+    |
+155 |     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + std::fmt::Debug,
+    |                                                                              +++++++++++++++++
+
+error[E0277]: `V` doesn't implement `Debug`
+   --> src/ex4c_refactoredTTL.rs:274:34
+    |
+274 |     pub fn start_cleanup_thread(&self) -> Result<()> {
+    |                                  ^^^^ `V` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+note: required by a bound in `KeyValueStoreTTL`
+   --> src/ex4c_refactoredTTL.rs:123:30
+    |
+120 | pub struct KeyValueStoreTTL<K, V>
+    |            ---------------- required by a bound in this struct
+...
+123 |     V: Clone + Send + Sync + Debug,
+    |                              ^^^^^ required by this bound in `KeyValueStoreTTL`
+help: consider further restricting this bound
+    |
+155 |     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + std::fmt::Debug,
+    |                                                                              +++++++++++++++++
+
+error[E0277]: `V` doesn't implement `Debug`
+   --> src/ex4c_refactoredTTL.rs:316:20
+    |
+316 |     pub fn insert(&self, key: K, val: V) -> Result<()> {
+    |                    ^^^^ `V` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+note: required by a bound in `KeyValueStoreTTL`
+   --> src/ex4c_refactoredTTL.rs:123:30
+    |
+120 | pub struct KeyValueStoreTTL<K, V>
+    |            ---------------- required by a bound in this struct
+...
+123 |     V: Clone + Send + Sync + Debug,
+    |                              ^^^^^ required by this bound in `KeyValueStoreTTL`
+help: consider further restricting this bound
+    |
+155 |     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + std::fmt::Debug,
+    |                                                                              +++++++++++++++++
+
+error[E0277]: `V` doesn't implement `Debug`
+   --> src/ex4c_refactoredTTL.rs:329:22
+    |
+329 |     pub fn retrieve(&self, key: K) -> Result<V> {
+    |                      ^^^^ `V` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+note: required by a bound in `KeyValueStoreTTL`
+   --> src/ex4c_refactoredTTL.rs:123:30
+    |
+120 | pub struct KeyValueStoreTTL<K, V>
+    |            ---------------- required by a bound in this struct
+...
+123 |     V: Clone + Send + Sync + Debug,
+    |                              ^^^^^ required by this bound in `KeyValueStoreTTL`
+help: consider further restricting this bound
+    |
+155 |     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + std::fmt::Debug,
+    |                                                                              +++++++++++++++++
+
+error[E0277]: `V` doesn't implement `Debug`
+   --> src/ex4c_refactoredTTL.rs:349:22
+    |
+349 |     pub fn get_keys(&self) -> Result<Vec<K>> {
+    |                      ^^^^ `V` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+note: required by a bound in `KeyValueStoreTTL`
+   --> src/ex4c_refactoredTTL.rs:123:30
+    |
+120 | pub struct KeyValueStoreTTL<K, V>
+    |            ---------------- required by a bound in this struct
+...
+123 |     V: Clone + Send + Sync + Debug,
+    |                              ^^^^^ required by this bound in `KeyValueStoreTTL`
+help: consider further restricting this bound
+    |
+155 |     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + std::fmt::Debug,
+    |                                                                              +++++++++++++++++
+
+error[E0277]: `K` doesn't implement `Debug`
+   --> src/ex4c_refactoredTTL.rs:367:18
+    |
+367 |     fn drop(&mut self) {
+    |                  ^^^^ `K` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+note: required by a bound in `KeyValueStoreTTL`
+   --> src/ex4c_refactoredTTL.rs:122:42
+    |
+120 | pub struct KeyValueStoreTTL<K, V>
+    |            ---------------- required by a bound in this struct
+121 | where
+122 |     K: Eq + Hash + Clone + Send + Sync + Debug,
+    |                                          ^^^^^ required by this bound in `KeyValueStoreTTL`
+help: consider further restricting this bound
+    |
+364 |     K: Eq + Hash + Clone + Send + Sync + std::fmt::Debug,
+    |                                        +++++++++++++++++
+
+error[E0277]: `V` doesn't implement `Debug`
+   --> src/ex4c_refactoredTTL.rs:367:18
+    |
+367 |     fn drop(&mut self) {
+    |                  ^^^^ `V` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+note: required by a bound in `KeyValueStoreTTL`
+   --> src/ex4c_refactoredTTL.rs:123:30
+    |
+120 | pub struct KeyValueStoreTTL<K, V>
+    |            ---------------- required by a bound in this struct
+...
+123 |     V: Clone + Send + Sync + Debug,
+    |                              ^^^^^ required by this bound in `KeyValueStoreTTL`
+help: consider further restricting this bound
+    |
+365 |     V: Clone + Send + Sync + std::fmt::Debug,
+    |                            +++++++++++++++++
+
+error[E0277]: `V` doesn't implement `Debug`
+   --> src/ex4c_refactoredTTL.rs:159:20
+    |
+159 |             store: Arc::new(RwLock::new(HashMap::new())),
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `V` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+note: required by a bound in `KeyValueStoreTTL`
+   --> src/ex4c_refactoredTTL.rs:123:30
+    |
+120 | pub struct KeyValueStoreTTL<K, V>
+    |            ---------------- required by a bound in this struct
+...
+123 |     V: Clone + Send + Sync + Debug,
+    |                              ^^^^^ required by this bound in `KeyValueStoreTTL`
+help: consider further restricting this bound
+    |
+155 |     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + std::fmt::Debug,
+    |                                                                              +++++++++++++++++
+
+error[E0277]: `V` doesn't implement `Debug`
+   --> src/ex4c_refactoredTTL.rs:175:22
+    |
+175 |         let kv_map = KeyValMap {
+    |                      ^^^^^^^^^ `V` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+note: required by a bound in `KeyValMap`
+   --> src/ex4c_refactoredTTL.rs:112:30
+    |
+109 | pub struct KeyValMap<K, V>
+    |            --------- required by a bound in this struct
+...
+112 |     V: Clone + Send + Sync + Debug,
+    |                              ^^^^^ required by this bound in `KeyValMap`
+help: consider further restricting this bound
+    |
+155 |     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + std::fmt::Debug,
+    |                                                                              +++++++++++++++++
+
+error[E0277]: `V` doesn't implement `Debug`
+    --> src/ex4c_refactoredTTL.rs:180:43
+     |
+180  |         let snapshot = serde_json::to_vec(&kv_map).context("Failed to serialize snapshot")?;
+     |                        ------------------ ^^^^^^^ `V` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+     |                        |
+     |                        required by a bound introduced by this call
+     |
+note: required for `KeyValMap<K, V>` to implement `Serialize`
+    --> src/ex4c_refactoredTTL.rs:108:16
+     |
+108  | #[derive(Debug,serde::Serialize, serde::Deserialize)]
+     |                ^^^^^^^^^^^^^^^^
+109  | pub struct KeyValMap<K, V>
+     |            ^^^^^^^^^^^^^^^
+...
+112  |     V: Clone + Send + Sync + Debug,
+     |                              ----- unsatisfied trait bound introduced in this `derive` macro
+note: required by a bound in `to_vec`
+    --> /home/jubajuba/.cargo/registry/src/index.crates.io-6f17d22bba15001f/serde_json-1.0.122/src/ser.rs:2177:17
+     |
+2175 | pub fn to_vec<T>(value: &T) -> Result<Vec<u8>>
+     |        ------ required by a bound in this function
+2176 | where
+2177 |     T: ?Sized + Serialize,
+     |                 ^^^^^^^^^ required by this bound in `to_vec`
+     = note: this error originates in the derive macro `serde::Serialize` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: consider further restricting this bound
+     |
+155  |     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + std::fmt::Debug,
+     |                                                                              +++++++++++++++++
+
+error[E0277]: `V` doesn't implement `Debug`
+   --> src/ex4c_refactoredTTL.rs:189:17
+    |
+189 |         let kv: KeyValMap<K, V> = serde_json::from_slice(data).context("Failed to deserialize snapshot")?;
+    |                 ^^^^^^^^^^^^^^^ `V` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+note: required by a bound in `KeyValMap`
+   --> src/ex4c_refactoredTTL.rs:112:30
+    |
+109 | pub struct KeyValMap<K, V>
+    |            --------- required by a bound in this struct
+...
+112 |     V: Clone + Send + Sync + Debug,
+    |                              ^^^^^ required by this bound in `KeyValMap`
+help: consider further restricting this bound
+    |
+155 |     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + std::fmt::Debug,
+    |                                                                              +++++++++++++++++
+
+error[E0277]: `V` doesn't implement `Debug`
+   --> src/ex4c_refactoredTTL.rs:189:35
+    |
+189 |         let kv: KeyValMap<K, V> = serde_json::from_slice(data).context("Failed to deserialize snapshot")?;
+    |                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `V` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+note: required by a bound in `KeyValMap`
+   --> src/ex4c_refactoredTTL.rs:112:30
+    |
+109 | pub struct KeyValMap<K, V>
+    |            --------- required by a bound in this struct
+...
+112 |     V: Clone + Send + Sync + Debug,
+    |                              ^^^^^ required by this bound in `KeyValMap`
+help: consider further restricting this bound
+    |
+155 |     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + std::fmt::Debug,
+    |                                                                              +++++++++++++++++
+
+error[E0277]: `V` doesn't implement `Debug`
+    --> src/ex4c_refactoredTTL.rs:189:35
+     |
+189  |         let kv: KeyValMap<K, V> = serde_json::from_slice(data).context("Failed to deserialize snapshot")?;
+     |                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `V` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+     |
+note: required for `KeyValMap<K, V>` to implement `Deserialize<'_>`
+    --> src/ex4c_refactoredTTL.rs:108:34
+     |
+108  | #[derive(Debug,serde::Serialize, serde::Deserialize)]
+     |                                  ^^^^^^^^^^^^^^^^^^
+109  | pub struct KeyValMap<K, V>
+     |            ^^^^^^^^^^^^^^^
+...
+112  |     V: Clone + Send + Sync + Debug,
+     |                              ----- unsatisfied trait bound introduced in this `derive` macro
+note: required by a bound in `from_slice`
+    --> /home/jubajuba/.cargo/registry/src/index.crates.io-6f17d22bba15001f/serde_json-1.0.122/src/de.rs:2635:8
+     |
+2633 | pub fn from_slice<'a, T>(v: &'a [u8]) -> Result<T>
+     |        ---------- required by a bound in this function
+2634 | where
+2635 |     T: de::Deserialize<'a>,
+     |        ^^^^^^^^^^^^^^^^^^^ required by this bound in `from_slice`
+     = note: this error originates in the derive macro `serde::Deserialize` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: consider further restricting this bound
+     |
+155  |     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + std::fmt::Debug,
+     |                                                                              +++++++++++++++++
+
+error[E0277]: `V` doesn't implement `Debug`
+   --> src/ex4c_refactoredTTL.rs:189:35
+    |
+189 |         let kv: KeyValMap<K, V> = serde_json::from_slice(data).context("Failed to deserialize snapshot")?;
+    |                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `V` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+note: required by a bound in `KeyValMap`
+   --> src/ex4c_refactoredTTL.rs:112:30
+    |
+109 | pub struct KeyValMap<K, V>
+    |            --------- required by a bound in this struct
+...
+112 |     V: Clone + Send + Sync + Debug,
+    |                              ^^^^^ required by this bound in `KeyValMap`
+help: consider further restricting this bound
+    |
+155 |     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + std::fmt::Debug,
+    |                                                                              +++++++++++++++++
+
+error[E0277]: `V` doesn't implement `Debug`
+   --> src/ex4c_refactoredTTL.rs:191:40
+    |
+191 |         debug!("Snapshot data: {:#?}", kv);
+    |                                        ^^ `V` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+    = note: this error originates in the macro `::core::format_args` which comes from the expansion of the macro `debug` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: consider further restricting this bound
+    |
+155 |     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + std::fmt::Debug,
+    |                                                                              +++++++++++++++++
+
+error[E0277]: `V` doesn't implement `Debug`
+   --> src/ex4c_refactoredTTL.rs:205:29
+    |
+205 |         let snapshot = self.create_snapshot()?;
+    |                             ^^^^^^^^^^^^^^^ `V` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+note: required by a bound in `KeyValueStoreTTL`
+   --> src/ex4c_refactoredTTL.rs:123:30
+    |
+120 | pub struct KeyValueStoreTTL<K, V>
+    |            ---------------- required by a bound in this struct
+...
+123 |     V: Clone + Send + Sync + Debug,
+    |                              ^^^^^ required by this bound in `KeyValueStoreTTL`
+help: consider further restricting this bound
+    |
+155 |     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + std::fmt::Debug,
+    |                                                                              +++++++++++++++++
+
+error[E0277]: `V` doesn't implement `Debug`
+   --> src/ex4c_refactoredTTL.rs:225:14
+    |
+225 |         self.restore_from_snapshot(&data)?;
+    |              ^^^^^^^^^^^^^^^^^^^^^ `V` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+note: required by a bound in `KeyValueStoreTTL`
+   --> src/ex4c_refactoredTTL.rs:123:30
+    |
+120 | pub struct KeyValueStoreTTL<K, V>
+    |            ---------------- required by a bound in this struct
+...
+123 |     V: Clone + Send + Sync + Debug,
+    |                              ^^^^^ required by this bound in `KeyValueStoreTTL`
+help: consider further restricting this bound
+    |
+155 |     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + std::fmt::Debug,
+    |                                                                              +++++++++++++++++
+
+error[E0277]: `V` doesn't implement `Debug`
+   --> src/ex4c_refactoredTTL.rs:287:29
+    |
+287 |             if let Err(e) = Self::cleanup_expired_entries(&store_clone) {
+    |                             ^^^^ `V` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+    |
+note: required by a bound in `KeyValueStoreTTL`
+   --> src/ex4c_refactoredTTL.rs:123:30
+    |
+120 | pub struct KeyValueStoreTTL<K, V>
+    |            ---------------- required by a bound in this struct
+...
+123 |     V: Clone + Send + Sync + Debug,
+    |                              ^^^^^ required by this bound in `KeyValueStoreTTL`
+help: consider further restricting this bound
+    |
+155 |     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + std::fmt::Debug,
+    |                                                                              +++++++++++++++++
+
+warning: unused import: `DeserializeSeed`
+ --> src/ex4c_refactoredTTL.rs:4:35
+  |
+4 | use serde::de::{DeserializeOwned, DeserializeSeed};
+  |                                   ^^^^^^^^^^^^^^^
+
+warning: unused import: `std::io::prelude`
+ --> src/ex4c_refactoredTTL.rs:9:5
+  |
+9 | use std::io::prelude::*;
+  |     ^^^^^^^^^^^^^^^^
+
+For more information about this error, try `rustc --explain E0277`.
+warning: `kademlia_mvp` (lib) generated 5 warnings
+error: could not compile `kademlia_mvp` (lib) due to 26 previous errors; 5 warnings emitted

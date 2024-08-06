@@ -1,36 +1,37 @@
-use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use thiserror::Error;
+// src/main.rs
 
-// mod error_handling_prac1;
-// mod error_prac2;
-// mod ex1;
-// mod ex2;
-// mod ex3;
-// mod ex4;
-// mod ex4b;
-// mod ex4b_ttl;
-// mod ex4b_mcsp;
-mod ex4c_refactoredTTL;
-// mod ex4c_alternativeDeserialize_Impl;
+use kademlia_mvp::*;
+use tokio::time::Duration;
+use tokio::time::sleep;
 
-fn main() {
-    // ex1::mainEx1()?;
-    // ex2::mainEx2();
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize logging
+    env_logger::init();
 
-    // ex4::mainEx4();
-    // ex4b_ttl::conc_test();
-    // ex4b_ttl::expire_test();
-    // ex4b_mcsp::mcsp_test();
+    // Create two nodes
+    let addr1 = "127.0.0.1:8001".parse()?;
+    let addr2 = "127.0.0.1:8002".parse()?;
+    let mut node1 = KademliaNode::new(addr1).await;
+    let node2 = KademliaNode::new(addr2).await;
 
-    // error_handling_prac1::error_prac_main();
-    // error_handling_prac1::error_prac_main();
-    // error_prac2::error_prac_main();
+    // Start node2 in the background
+    tokio::spawn(async move {
+        node2.start().await.unwrap();
+    });
 
-    ex4c_refactoredTTL::main();
-    
-    
+    // Allow some time for node2 to start
+    sleep(Duration::from_millis(100)).await;
+
+    // Node1 pings Node2
+    node1.ping(addr2).await?;
+
+    // Bootstrap node1 using node2 as the bootstrap node
+    node1.bootstrap(vec![addr2]).await?;
+
+    // Print Node1's routing table
+    let closest_nodes = node1.get_closest_nodes(&node1.id, 10);
+    println!("Node1's closest nodes: {:?}", closest_nodes);
+
+    Ok(())
 }
