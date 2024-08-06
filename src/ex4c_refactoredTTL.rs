@@ -15,9 +15,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber;
+use std::fmt::Debug;
+
 
 #[derive(Debug, thiserror::Error)]
-enum KVStoreError {
+pub enum KVStoreError {
     #[error("Lock acquisition failed: {0}")]
     LockError(String),
     #[error("Key not found: {0}")]
@@ -35,7 +37,13 @@ enum KVStoreError {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct SerdeInstant(Instant);
+pub struct SerdeInstant(Instant);
+
+impl SerdeInstant {
+    pub fn new(instant: Instant) -> Self {
+        SerdeInstant(instant)
+    }
+}
 
 impl Serialize for SerdeInstant {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -47,64 +55,78 @@ impl Serialize for SerdeInstant {
     }
 }
 
+//  lifetime parameter 'de, which is necessary for the deserialization process.
 impl<'de> Deserialize<'de> for SerdeInstant {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
+        // Deserialize an i64 value from the deserializer.
+        // This value represents the number of seconds from the current time.
         let secs = i64::deserialize(deserializer)?;
+
+        // Convert the deserialized i64 value into a Duration.
+        // We use unsigned_abs() to handle both positive and negative values.
+        // unsigned_abs() ensures we always get a non-negative duration.
         let duration = Duration::from_secs(secs.unsigned_abs() as u64);
+
+        // Determine the Instant based on whether the deserialized value is positive or negative.
+        // If secs is negative, we subtract the duration from the current time.
+        // If secs is positive, we add the duration to the current time.
         let instant = if secs.is_negative() {
             Instant::now() - duration
         } else {
             Instant::now() + duration
         };
+
+        // Wrap the calculated Instant in a SerdeInstant struct and return it.
         Ok(SerdeInstant(instant))
     }
 }
 
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
-struct ValueWithTTL<V: Clone + Send + Sync> {
-    val: V,
-    expire_time: Option<SerdeInstant>,
+pub struct ValueWithTTL<V: Clone + Send + Sync + Debug> {
+    pub val: V,
+    pub expire_time: Option<SerdeInstant>,
 }
 
 impl<V: Clone + Send + Sync> ValueWithTTL<V> {
-    fn new(val: V) -> Self {
+    pub fn new(val: V) -> Self {
         ValueWithTTL {
             val,
             expire_time: Some(SerdeInstant(Instant::now() + Duration::new(10, 0))),
         }
     }
 
-    fn is_expired(&self) -> bool {
+    pub fn is_expired(&self) -> bool {
         self.expire_time
             .map_or(false, |exp_time| exp_time.0 <= Instant::now())
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug,serde::Serialize, serde::Deserialize)]
 pub struct KeyValMap<K, V>
 where
-    K: Eq + Hash + Clone + Send + Sync,
-    V: Clone + Send + Sync,
+    K: Eq + Hash + Clone + Send + Sync + Debug,
+    V: Clone + Send + Sync + Debug,
 {
     value: HashMap<K, ValueWithTTL<V>>,
     #[serde(skip)]
     _phantom: PhantomData<(K, V)>,
 }
 
-#[derive(Clone)]
+#[derive(Debug,Clone)]
 pub struct KeyValueStoreTTL<K, V>
 where
-    K: Eq + Hash + Clone + Send + Sync,
-    V: Clone + Send + Sync,
+    K: Eq + Hash + Clone + Send + Sync + Debug,
+    V: Clone + Send + Sync + Debug,
 {
-    store: Arc<RwLock<HashMap<K, ValueWithTTL<V>>>>,
-    stop_flag: Arc<AtomicBool>,
-    stop_snapshot_flag: Arc<AtomicBool>,
-    cleanup_thread: Arc<RwLock<Option<thread::JoinHandle<()>>>>,
-    snapshot_thread: Arc<RwLock<Option<thread::JoinHandle<Result<(), KVStoreError>>>>>,
+    pub store: Arc<RwLock<HashMap<K, ValueWithTTL<V>>>>,
+    pub stop_flag: Arc<AtomicBool>,
+    pub stop_snapshot_flag: Arc<AtomicBool>,
+    pub cleanup_thread: Arc<RwLock<Option<thread::JoinHandle<()>>>>,
+    pub snapshot_thread: Arc<RwLock<Option<thread::JoinHandle<Result<(), KVStoreError>>>>>,
 }
 
 impl From<std::io::Error> for KVStoreError {
@@ -126,13 +148,13 @@ where
         + Clone
         + Send
         + Sync
-        + std::fmt::Debug
+        + Debug
         + 'static
         + Serialize
         + for<'de> Deserialize<'de>,
     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de>,
 {
-    fn new() -> Self {
+    pub fn new() -> Self {
         KeyValueStoreTTL {
             store: Arc::new(RwLock::new(HashMap::new())),
             stop_flag: Arc::new(AtomicBool::new(false)),
@@ -145,6 +167,7 @@ where
 
     pub fn create_snapshot(&self) -> Result<Vec<u8>> {
         debug!("Creating snapshot...");
+        
         let store_read: std::sync::RwLockReadGuard<HashMap<K, ValueWithTTL<V>>> = self
             .store
             .read()
@@ -153,18 +176,25 @@ where
             value: store_read.clone(),
             _phantom: PhantomData,
         };
-        serde_json::to_vec(&kv_map).map_err(|e| anyhow!("serde_json::to_vec() FAIL: {:#?}", e))
+        // let snapshot = serde_json::to_vec(&kv_map).map_err(|e| anyhow!("serde_json::to_vec() FAIL: {:#?}", e));
+        let snapshot = serde_json::to_vec(&kv_map).context("Failed to serialize snapshot")?;
+        
+        debug!("Snapshot created: {:?}",snapshot);
+        Ok(snapshot)
     }
 
     pub fn restore_from_snapshot(&self, data: &[u8]) -> Result<()> {
         debug!("Restoring from snapshot...");
-        let kv: KeyValMap<K, V> =
-            serde_json::from_slice(data).map_err(|e| anyhow!("Deserialization error: {:#?}", e))?;
+        // let kv: KeyValMap<K, V> = serde_json::from_slice(data).map_err(|e| anyhow!("Deserialization error: {:#?}", e))?;
+        let kv: KeyValMap<K, V> = serde_json::from_slice(data).context("Failed to deserialize snapshot")?;
+        
+        debug!("Snapshot data: {:#?}", kv);
 
         let mut store_write = self
             .store
             .write()
             .map_err(|e| anyhow!("Lock acquisition failed: {:#?}", e))?;
+
         *store_write = kv.value;
 
         Ok(())
@@ -241,7 +271,7 @@ where
         Ok(())
     }
 
-    fn start_cleanup_thread(&self) -> Result<()> {
+    pub fn start_cleanup_thread(&self) -> Result<()> {
         debug!("Starting cleanup thread...");
         let store_clone = self.store.clone();
         let flag_clone = self.stop_flag.clone();
@@ -268,7 +298,7 @@ where
         Ok(())
     }
 
-    fn cleanup_expired_entries(store: &Arc<RwLock<HashMap<K, ValueWithTTL<V>>>>) -> Result<()> {
+    pub fn cleanup_expired_entries(store: &Arc<RwLock<HashMap<K, ValueWithTTL<V>>>>) -> Result<()> {
         debug!("Cleaning up expired entries...");
         let mut s = store
             .write()
@@ -283,7 +313,7 @@ where
         Ok(())
     }
 
-    fn insert(&self, key: K, val: V) -> Result<()> {
+    pub fn insert(&self, key: K, val: V) -> Result<()> {
         debug!("Inserting key: {:?}", key);
         let ttl_val = ValueWithTTL::new(val);
 
@@ -296,7 +326,7 @@ where
         Ok(())
     }
 
-    fn retrieve(&self, key: K) -> Result<V> {
+    pub fn retrieve(&self, key: K) -> Result<V> {
         debug!("Retrieving key: {:?}", key);
         let store = self
             .store
@@ -316,7 +346,7 @@ where
         Ok(ttl_val.val.clone())
     }
 
-    fn get_keys(&self) -> Result<Vec<K>> {
+    pub fn get_keys(&self) -> Result<Vec<K>> {
         debug!("Getting all keys...");
         let store = self
             .store
@@ -429,3 +459,170 @@ pub fn main() -> Result<()> {
 
     // Ok(())
 }
+
+
+// #[cfg(test)]
+// pub mod tests {
+//     use super::*;
+
+//     #[test]
+//     fn test_insert_and_retrieve() {
+//         let store: KeyValueStoreTTL<String, i32> = KeyValueStoreTTL::new();
+        
+//         store.insert("key1".to_string(), 42).unwrap();
+//         let val = store.retrieve("key1".to_string()).unwrap();
+//         assert_eq!(val, 42);
+//     }
+
+//     #[test]
+//     fn test_expired_entry() {
+//         let store: KeyValueStoreTTL<String, i32> = KeyValueStoreTTL::new();
+        
+//         store.insert("key1".to_string(), 42).unwrap();
+//         thread::sleep(Duration::from_secs(11)); // Wait for the entry to expire
+        
+//         let result = store.retrieve("key1".to_string());
+//         // assert!(matches!(result, Err(KVStoreError::ExpiredEntry(_))));
+
+
+//         assert!(matches!(result.unwrap_err().downcast_ref::<KVStoreError>(), Some(KVStoreError::ExpiredEntry(_))));
+
+//     }
+
+//     #[test]
+//     fn test_cleanup_thread() {
+//         let store: KeyValueStoreTTL<String, i32> = KeyValueStoreTTL::new();
+//         store.start_cleanup_thread().unwrap();
+        
+//         store.insert("key1".to_string(), 42).unwrap();
+//         store.insert("key2".to_string(), 24).unwrap();
+        
+//         thread::sleep(Duration::from_secs(11)); // Wait for entries to expire and cleanup to occur
+        
+//         let keys = store.get_keys().unwrap();
+//         assert!(keys.is_empty());
+//     }
+
+//     #[test]
+//     fn test_snapshot_and_restore() {
+//         let store: KeyValueStoreTTL<String, i32> = KeyValueStoreTTL::new();
+        
+//         store.insert("key1".to_string(), 42).unwrap();
+//         store.insert("key2".to_string(), 24).unwrap();
+        
+//         let snapshot = store.create_snapshot().unwrap();
+        
+//         // Modify the store
+//         store.insert("key3".to_string(), 99).unwrap();
+        
+//         // Restore from snapshot
+//         store.restore_from_snapshot(&snapshot).unwrap();
+        
+//         let keys = store.get_keys().unwrap();
+//         assert_eq!(keys.len(), 2);
+//         assert!(keys.contains(&"key1".to_string()));
+//         assert!(keys.contains(&"key2".to_string()));
+//         assert!(!keys.contains(&"key3".to_string()));
+//     }
+
+//     #[test]
+//     fn test_snapshot_to_file() {
+//         let store: KeyValueStoreTTL<String, i32> = KeyValueStoreTTL::new();
+//         let path = Path::new("test_snapshot.json");
+        
+//         store.insert("key1".to_string(), 42).unwrap();
+//         store.save_snapshot_to_file(path).unwrap();
+        
+//         assert!(path.exists());
+        
+//         // Clean up
+//         std::fs::remove_file(path).unwrap();
+//     }
+
+//     #[test]
+//     fn test_load_snapshot_from_file() {
+//         let store: KeyValueStoreTTL<String, i32> = KeyValueStoreTTL::new();
+//         let path = Path::new("test_snapshot.json");
+        
+//         store.insert("key1".to_string(), 42).unwrap();
+//         store.save_snapshot_to_file(path).unwrap();
+        
+//         // Modify the store
+//         store.insert("key2".to_string(), 24).unwrap();
+        
+//         // Load snapshot
+//         store.load_snapshot_from_file(path).unwrap();
+        
+//         let keys = store.get_keys().unwrap();
+//         assert_eq!(keys.len(), 1);
+//         assert!(keys.contains(&"key1".to_string()));
+//         assert!(!keys.contains(&"key2".to_string()));
+        
+//         // Clean up
+//         std::fs::remove_file(path).unwrap();
+//     }
+
+//     #[test]
+//     fn test_concurrent_access() {
+//         let store = Arc::new(KeyValueStoreTTL::<String, i32>::new());
+//         let threads_count = 10;
+//         let mut handles = vec![];
+        
+//         for i in 0..threads_count {
+//             let store_clone = store.clone();
+//             let handle = thread::spawn(move || {
+//                 store_clone.insert(format!("key{}", i), i).unwrap();
+//                 let val = store_clone.retrieve(format!("key{}", i)).unwrap();
+//                 assert_eq!(val, i);
+//             });
+//             handles.push(handle);
+//         }
+        
+//         for handle in handles {
+//             handle.join().unwrap();
+//         }
+        
+//         let keys = store.get_keys().unwrap();
+//         // assert_eq!(keys.len(), threads_count);
+//         assert_eq!(keys.len(), threads_count as usize);
+
+//     }
+
+//     #[test]
+//     fn test_snapshot_thread() {
+//         let store = Arc::new(KeyValueStoreTTL::<String, i32>::new());
+//         let path = Path::new("test_snapshot_thread.json");
+        
+//         store.start_snapshot_thread(Duration::from_secs(1), path.to_path_buf()).unwrap();
+        
+//         store.insert("key1".to_string(), 42).unwrap();
+        
+//         thread::sleep(Duration::from_secs(2)); // Wait for snapshot to occur
+        
+//         assert!(path.exists());
+        
+//         // Clean up
+//         std::fs::remove_file(path).unwrap();
+//     }
+
+//     #[test]
+//     fn test_key_not_found() {
+//         let store: KeyValueStoreTTL<String, i32> = KeyValueStoreTTL::new();
+        
+//         let result = store.retrieve("non_existent_key".to_string());
+//         // assert!(matches!(result, Err(KVStoreError::KeyNotFound(_))));
+//         assert!(matches!(result.unwrap_err().downcast_ref::<KVStoreError>(), Some(KVStoreError::KeyNotFound(_))));
+
+//     }
+
+//     #[test]
+//     fn test_insert_overwrite() {
+//         let store: KeyValueStoreTTL<String, i32> = KeyValueStoreTTL::new();
+        
+//         store.insert("key1".to_string(), 42).unwrap();
+//         store.insert("key1".to_string(), 24).unwrap();
+        
+//         let val = store.retrieve("key1".to_string()).unwrap();
+//         assert_eq!(val, 24);
+//     }
+// }

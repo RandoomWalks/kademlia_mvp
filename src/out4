@@ -1,0 +1,8 @@
+   Compiling kademlia_mvp v0.1.0 (/home/jubajuba/code/rust/study_plan/scratch/kademlia_mvp)
+error: expected one of `+`, `,`, `::`, or `{`, found `d`
+   --> src/async_map.rs:126:77
+    |
+126 |     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de>d
+    |                                                                             ^ expected one of `+`, `,`, `::`, or `{`
+
+error: could not compile `kademlia_mvp` (lib) due to 1 previous error
