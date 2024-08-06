@@ -367,7 +367,7 @@ pub mod tests {
         let mut bucket = KBucket::new();
         let node_id = NodeId::new();
         let addr = "127.0.0.1:8000".parse().unwrap();
-
+        
         bucket.update(node_id, addr);
         assert_eq!(bucket.entries.len(), 1);
         assert_eq!(bucket.entries[0].node_id, node_id);

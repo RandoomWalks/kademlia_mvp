@@ -1,9 +1,4 @@
 // src/lib.rs
-
-// pub mod kade; // If you have additional modules like `kade`
-// pub mod ex4c_refactoredTTL; // If you have additional modules like `ex4c_refactoredTTL`
-
-// Example of moving core logic to lib.rs
 use log::{debug, error, info, warn};
 use rand;
 use serde::{Deserialize, Serialize};
@@ -23,14 +18,7 @@ const BUCKET_REFRESH_INTERVAL: Duration = Duration::from_secs(3600); // 1 hour
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct NodeId([u8; 32]);
 
-// impl NodeId {
-//     pub fn new(data:[u8; 32] ) -> Self {
-//         NodeId(data)
-//     }
-// }
-
 // Implement `Display` for `MinMax`.
-
 impl fmt::Display for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "(")?;
@@ -48,8 +36,11 @@ impl NodeId {
     /// Creates a new NodeId with random bytes.
     pub fn new() -> Self {
         let random_bytes: [u8; 32] = rand::random();
-        NodeId(random_bytes)
+        let node_id = NodeId(random_bytes);
+        println!("Created new NodeId: {:?}", node_id);
+        node_id
     }
+
 
     /// Generates a NodeId from a given key using SHA-256 hashing.
     pub fn from_key<K: AsRef<[u8]>>(key: K) -> Self {
@@ -58,27 +49,25 @@ impl NodeId {
         let result = hasher.finalize();
         let mut id = [0u8; 32];
         id.copy_from_slice(&result);
-        NodeId(id)
+        let node_id = NodeId(id);
+        println!("Created NodeId from key: {:?}", node_id);
+        node_id
     }
 
-    /// Creates a new NodeId from a given array of bytes.
     pub fn from_bytes(data: [u8; 32]) -> Self {
-        NodeId(data)
+        let node_id = NodeId(data);
+        println!("Created NodeId from bytes: {:?}", node_id);
+        node_id
     }
 
-    // pub fn get_distance(&self) -> &[u8; 32] {
-
-    pub fn _distance_internal(&self) -> &[u8; 32] {
-        &self.0
-    }
-
-    /// Calculates the XOR distance between two NodeIds.
     pub fn distance(&self, other: &NodeId) -> NodeId {
         let mut result = [0u8; 32];
         for i in 0..32 {
             result[i] = self.0[i] ^ other.0[i];
         }
-        NodeId(result)
+        let distance = NodeId(result);
+        println!("Calculated distance between {:?} and {:?}: {:?}", self, other, distance);
+        distance
     }
     
 }
@@ -124,22 +113,28 @@ impl KBucket {
             entry.last_seen = Instant::now();
             entry.addr = addr;
             self.entries.push_back(entry);
+            println!("Updated existing entry in k-bucket for {:?}", node_id);
         } else if self.entries.len() < K {
             self.entries.push_back(KBucketEntry {
                 node_id,
                 addr,
                 last_seen: Instant::now(),
             });
+            println!("Added new entry to k-bucket for {:?}", node_id);
         } else {
-            // If the bucket is full, you might ping the least-recently seen node
-            // and replace it if it doesn't respond. For now, we'll just ignore the new node.
+            println!("K-bucket is full, ignoring new entry for {:?}", node_id);
         }
         self.last_updated = Instant::now();
     }
 
-    /// Checks if the k-bucket needs to be refreshed.
     pub fn needs_refresh(&self) -> bool {
-        self.last_updated.elapsed() > BUCKET_REFRESH_INTERVAL
+        let needs_refresh = self.last_updated.elapsed() > BUCKET_REFRESH_INTERVAL;
+        debug!(
+            "Checking if k-bucket needs refresh (last updated: {:?}, needs refresh: {})",
+            self.last_updated,
+            needs_refresh
+        );
+        needs_refresh
     }
 }
 
@@ -163,9 +158,9 @@ impl RoutingTable {
         let distance = self.node_id.distance(&node);
         let bucket_index = distance.0.iter().position(|&x| x != 0).unwrap_or(255);
         self.buckets[bucket_index].update(node, addr);
+        println!("Updated routing table with node {:?} at distance {}", node, bucket_index);
     }
 
-    /// Retrieves the closest nodes to a target node ID.
     pub fn get_closest_nodes(&self, target: &NodeId, count: usize) -> Vec<(NodeId, SocketAddr)> {
         let mut all_nodes: Vec<_> = self
             .buckets
@@ -179,7 +174,9 @@ impl RoutingTable {
             .collect();
 
         all_nodes.sort_by_key(|(node_id, _)| node_id.distance(target));
-        all_nodes.into_iter().take(count).collect()
+        let closest_nodes = all_nodes.into_iter().take(count).collect();
+        println!("Retrieved closest nodes to {:?}: {:?}", target, closest_nodes);
+        closest_nodes
     }
 }
 
@@ -216,6 +213,7 @@ impl KademliaNode {
     /// Creates a new Kademlia node with a random ID.
     pub async fn new(addr: SocketAddr) -> Self {
         let id = NodeId::new();
+        println!("Creating new KademliaNode with ID: {:?} and address: {}", id, addr);
         KademliaNode {
             id: id.clone(),
             addr,
@@ -223,17 +221,18 @@ impl KademliaNode {
         }
     }
 
+
     /// Starts the node, listening for incoming connections and handling messages.
     pub async fn start(&self) -> Result<(), KademliaError> {
         let listener = TcpListener::bind(self.addr).await?;
-        info!("Node {} listening on: {}", self.id, self.addr);
+        println!("Node {} listening on: {}", self.id, self.addr);
 
         loop {
             let (socket, _) = listener.accept().await?;
             let node_id = self.id;
             tokio::spawn(async move {
                 if let Err(e) = KademliaNode::handle_connection(socket, node_id).await {
-                    error!("Error handling connection: {:?}", e);
+                    println!("Error handling connection: {:?}", e);
                 }
             });
         }
@@ -250,20 +249,20 @@ impl KademliaNode {
 
         match message {
             Message::Ping { sender } => {
-                debug!("Received PING from: {:?}", sender);
+                println!("Received PING from: {:?}", sender);
                 let response = Message::Pong { sender: node_id };
                 let serialized = bincode::serialize(&response)?;
                 socket.write_all(&serialized).await?;
             }
             Message::FindNode { sender, target } => {
-                debug!("Received FIND_NODE for {:?} from: {:?}", target, sender);
+                println!("Received FIND_NODE for {:?} from: {:?}", target, sender);
                 // In a real implementation, we would search the routing table here
                 let response = Message::FindNodeResponse { nodes: vec![] };
                 let serialized = bincode::serialize(&response)?;
                 socket.write_all(&serialized).await?;
             }
             _ => {
-                error!("Unexpected message: {:?}", message);
+                println!("Unexpected message: {:?}", message);
                 return Err(KademliaError::UnexpectedMessage);
             }
         }
@@ -273,7 +272,7 @@ impl KademliaNode {
 
     /// Sends a ping message to a target node.
     pub async fn ping(&self, target: SocketAddr) -> Result<(), KademliaError> {
-        debug!("Pinging node at {}", target);
+        println!("Pinging node at {}", target);
         let mut stream = TcpStream::connect(target).await?;
         let message = Message::Ping { sender: self.id };
         let serialized = bincode::serialize(&message)?;
@@ -285,11 +284,11 @@ impl KademliaNode {
 
         match response {
             Message::Pong { sender } => {
-                info!("Received PONG from: {:?}", sender);
+                println!("Received PONG from: {:?}", sender);
                 Ok(())
             }
             _ => {
-                error!("Unexpected response to PING");
+                println!("Unexpected response to PING");
                 Err(KademliaError::UnexpectedMessage)
             }
         }
