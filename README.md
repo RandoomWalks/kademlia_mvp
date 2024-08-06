@@ -83,15 +83,98 @@ The Kademlia MVP project is structured around the core components of the Kademli
 
 ### Components
 
-1. **NodeId**: Represents a unique identifier for a node in the network, implemented using a 256-bit (32-byte) array. The NodeId is generated using random bytes or derived from a key using SHA-256 hashing.
+## NodeId
 
-2. **KBucket**: A k-bucket is a list of nodes stored in a routing table. Each k-bucket stores up to `K` nodes and is periodically refreshed to maintain active connections.
+### Description
 
-3. **RoutingTable**: The routing table is composed of multiple k-buckets. It is responsible for maintaining and updating the network's topology by storing the closest nodes to a given NodeId.
+The `NodeId` struct represents a unique identifier for a node in the Kademlia network. It is implemented as a 256-bit (32-byte) array.
 
-4. **Message**: Defines the types of messages exchanged between nodes, including Ping, Pong, FindNode, and FindNodeResponse.
+### Implementation
 
-5. **KademliaNode**: Represents a node in the Kademlia network. It handles the creation, startup, and communication with other nodes, including sending and receiving messages, and managing the routing table.
+- **Random Generation**: Uses `rand::random` to generate a random 256-bit identifier.
+- **SHA-256 Hashing**: Provides a method to create a `NodeId` from a given key using SHA-256 hashing.
+- **Distance Calculation**: Implements the XOR metric for calculating the distance between two `NodeId` values.
+
+
+## KBucket
+
+### Description
+
+A `KBucket` is a list of nodes stored in the routing table. Each k-bucket can store up to `K` nodes and is periodically refreshed.
+
+### Implementation
+
+- **Node Storage**: Uses a `VecDeque` to store `KBucketEntry` values.
+- **Entry Management**: Provides methods to update the k-bucket with new nodes and manage the `last_seen` timestamps.
+- **Refresh Checking**: Checks if the k-bucket needs to be refreshed based on a predefined interval.
+
+
+## RoutingTable
+
+### Description
+
+The `RoutingTable` maintains the topology of the Kademlia network by storing multiple `KBucket` instances. It is responsible for managing and updating the network's routing information.
+
+### Implementation
+
+- **Bucket Management**: Initializes 256 k-buckets to cover all possible distances in the XOR metric.
+- **Node Updates**: Updates the appropriate k-bucket based on the distance between the current node and the target node.
+- **Closest Nodes Retrieval**: Retrieves the closest nodes to a given target `NodeId`.
+
+
+## Message
+
+### Description
+
+The `Message` enum defines the types of messages exchanged between Kademlia nodes. These messages facilitate node discovery and communication within the network.
+
+### Implementation
+
+- **Message Types**: Includes `Ping`, `Pong`, `FindNode`, and `FindNodeResponse`.
+- **Serialization**: Implements serialization and deserialization using `serde`.
+
+
+## KademliaNode
+
+### Description
+
+The `KademliaNode` struct represents a node in the Kademlia network. It manages the node's identity, address, and routing table, and handles network communication.
+
+### Implementation
+
+- **Node Initialization**: Creates a new node with a random `NodeId` and a specified `SocketAddr`.
+- **Network Listener**: Binds a TCP listener to the node's address to handle incoming connections.
+- **Message Handling**: Processes incoming messages and responds appropriately.
+- **Ping and FindNode Operations**: Implements the core Kademlia operations for node discovery and communication.
+
+
+## Network Communication
+
+### Description
+
+Network communication is handled using asynchronous TCP connections provided by the `tokio` library. Nodes communicate by sending and receiving serialized `Message` structs.
+
+### Implementation
+
+- **TCP Listener**: Listens for incoming connections and spawns a new task to handle each connection.
+- **Message Serialization**: Uses `bincode` for efficient binary serialization of messages.
+- **Asynchronous I/O**: Uses `tokio::io` for non-blocking read and write operations.
+
+
+## Bootstrap Process
+
+### Description
+
+The bootstrap process is responsible for initializing a node's routing table by discovering and communicating with a list of known bootstrap nodes.
+
+### Implementation
+
+- **Ping Bootstrap Nodes**: Sends a ping message to each bootstrap node to verify connectivity.
+- **Update Routing Table**: Updates the routing table with nodes discovered during the bootstrap process.
+- **Perform FindNode**: Uses the `FindNode` message to discover additional nodes and further populate the routing table.
+
+---
+
 
 ### Diagrams
 
