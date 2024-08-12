@@ -1,26 +1,22 @@
 // src/main.rs
 
-// use kademlia_mvp::*;
-use tokio::time::{Duration};
-use tokio::time::sleep;
 use log::{debug, error, info, warn};
+use tokio::time::Duration;
 
-use std::collections::{HashMap, BinaryHeap};
-use std::net::{SocketAddr, UdpSocket};
-use std::cmp::Ordering;
-// use std::time::{Duration, Instant};
-use std::time::{Instant};
+use bincode::{deserialize, serialize, ErrorKind};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use bincode::{serialize, deserialize};
-use serde::{Serialize, Deserialize};
-use std::time::SystemTime;
-
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
+use std::net::{SocketAddr, UdpSocket};
+use std::time::{Instant, SystemTime};
+use std::u64::MAX;
 
 const K: usize = 20; // Maximum number of nodes in a k-bucket
 const ALPHA: usize = 3; // Number of parallel lookups
 const BOOTSTRAP_NODES: [&str; 1] = ["127.0.0.1:33333"]; // Hardcoded bootstrap node
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize,Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Debug)]
 pub struct NodeId([u8; 32]);
 
 impl NodeId {
@@ -28,7 +24,7 @@ impl NodeId {
         let random_bytes: [u8; 32] = rand::random();
         NodeId(random_bytes)
     }
-    
+
     pub fn distance(&self, other: &NodeId) -> NodeId {
         let mut result = [0u8; 32];
         for i in 0..32 {
@@ -54,7 +50,7 @@ impl PartialOrd for NodeId {
 struct KBucketEntry {
     node_id: NodeId,
     addr: SocketAddr,
-    last_seen: std::time::SystemTime,
+    last_seen: SystemTime,
 }
 
 struct KBucket {
@@ -69,27 +65,51 @@ impl KBucket {
     }
 
     fn update(&mut self, node_id: NodeId, addr: SocketAddr) {
-        if let Some(index) = self.entries.iter().position(|entry| entry.node_id == node_id) {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.node_id == node_id)
+        {
             let mut entry = self.entries.remove(index);
             entry.last_seen = SystemTime::now();
             self.entries.push(entry);
+            info!("Updated node {:#?} in k-bucket", node_id);
         } else if self.entries.len() < K {
-            self.entries.push(KBucketEntry { node_id, addr, last_seen: SystemTime::now() });
+            self.entries.push(KBucketEntry {
+                node_id,
+                addr,
+                last_seen: SystemTime::now(),
+            });
+            info!("Added new node {:#?} to k-bucket", node_id);
         } else {
             // Implement node eviction policy
-            if let Some(oldest) = self.entries.iter().min_by_key(|e| e.last_seen) {
-                let oldest_res: Result<Duration, std::time::SystemTimeError> = oldest.last_seen.elapsed();
-                if let Ok(oldtest_time) = oldest_res {
-                    if oldtest_time > Duration::from_secs(3600) { // 1 hour
-                        let index = self.entries.iter().position(|e| e.node_id == oldest.node_id).unwrap();
-                        self.entries.remove(index);
-                        self.entries.push(KBucketEntry { node_id, addr, last_seen: SystemTime::now() });
-                    }
-                } else {
-                    // error
-                    
-                }
+            // Use a separate scope to find the oldest entry and its index
+            let (oldest_index, should_evict) = {
+                let oldest = self.entries
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|&(_, entry)| entry.last_seen)
+                    .expect("There should be at least one entry in the bucket");
+
+                let should_evict = match oldest.1.last_seen.elapsed() {
+                    Ok(elapsed) => elapsed > Duration::from_secs(3600), // 1 hour
+                    Err(_) => false,
+                };
+
+                (oldest.0, should_evict)
+            };
+
+            // Now that the immutable borrow is out of scope, we can mutate self.entries
+            if should_evict {
+                let evicted_node_id = self.entries[oldest_index].node_id;
+                self.entries.remove(oldest_index);
+                self.entries.push(KBucketEntry { node_id, addr, last_seen: SystemTime::now() });
+                info!("Evicted oldest node {:?} and added new node {:?}", evicted_node_id, node_id);
+            } else {
+                let oldest_entry = &self.entries[oldest_index];
+                warn!("Oldest node {:?} was not evicted as it was recently seen", oldest_entry.node_id);
             }
+
         }
     }
 }
@@ -111,11 +131,12 @@ impl RoutingTable {
         let distance = self.node_id.distance(&node);
         let bucket_index = distance.0.iter().position(|&x| x != 0).unwrap_or(255);
         self.buckets[bucket_index].update(node, addr);
+        debug!("Updated routing table for node {:#?}", node);
     }
 
     fn find_closest(&self, target: &NodeId, count: usize) -> Vec<(NodeId, SocketAddr)> {
         let mut heap = BinaryHeap::new();
-        
+
         for bucket in &self.buckets {
             for entry in &bucket.entries {
                 let distance = entry.node_id.distance(target);
@@ -123,10 +144,14 @@ impl RoutingTable {
             }
         }
 
-        heap.into_iter()
+        let closest_nodes = heap
+            .into_iter()
             .take(count)
             .map(|(_, node_id, addr)| (node_id, addr))
-            .collect()
+            .collect();
+
+        info!("Found closest nodes to {:#?}: {:?}", target, closest_nodes);
+        closest_nodes
     }
 }
 
@@ -143,7 +168,7 @@ impl KademliaNode {
         let id = NodeId::new();
         let socket = UdpSocket::bind(addr)?;
         socket.set_nonblocking(true)?;
-        
+
         Ok(KademliaNode {
             id: id.clone(),
             addr,
@@ -155,8 +180,16 @@ impl KademliaNode {
 
     pub fn bootstrap(&mut self) -> std::io::Result<()> {
         for &bootstrap_addr in BOOTSTRAP_NODES.iter() {
-            if let Ok(addr) = bootstrap_addr.parse() {
-                self.ping(addr)?;
+            match bootstrap_addr.parse() {
+                Ok(addr) => {
+                    if let Err(e) = self.ping(addr) {
+                        error!(
+                            "Failed to ping bootstrap node {:#?}: {:?}",
+                            bootstrap_addr, e
+                        );
+                    }
+                }
+                Err(e) => error!("Invalid bootstrap address {:#?}: {:?}", bootstrap_addr, e),
             }
         }
         Ok(())
@@ -166,15 +199,22 @@ impl KademliaNode {
         let mut buf = [0u8; 1024];
         loop {
             match self.socket.recv_from(&mut buf) {
-                Ok((size, src)) => {
-                    if let Ok(message) = deserialize(&buf[..size]) {
-                        self.handle_message(message, src)?;
+                Ok((size, src)) => match deserialize(&buf[..size]) {
+                    Ok(message) => {
+                        if let Err(e) = self.handle_message(message, src) {
+                            error!("Failed to handle message from {:#?}: {:?}", src, e);
+                        }
                     }
-                }
+                    Err(e) => error!("Failed to deserialize message from {:#?}: {:?}", src, e),
+                },
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // No data available, continue with other tasks
+                    debug!("No data available, continuing");
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    error!("Socket error: {:?}", e);
+                    return Err(e);
+                }
             }
             // Perform periodic tasks here (e.g., refresh buckets, republish data)
         }
@@ -185,45 +225,55 @@ impl KademliaNode {
             Message::Ping { sender } => {
                 self.routing_table.update(sender, src);
                 self.send_message(&Message::Pong { sender: self.id }, src)?;
+                info!("Received Ping from {:#?}, responded with Pong", src);
             }
             Message::Pong { sender } => {
                 self.routing_table.update(sender, src);
+                info!("Received Pong from {:#?}", src);
             }
             Message::Store { key, value } => {
                 self.store(&key, &value);
                 self.send_message(&Message::Stored, src)?;
+                info!("Stored value for key {:?} from {:#?}", key, src);
             }
             Message::FindNode { target } => {
                 let nodes = self.find_node(&target);
                 self.send_message(&Message::NodesFound(nodes), src)?;
+                info!(
+                    "Received FindNode from {:#?}, responded with NodesFound",
+                    src
+                );
             }
-            Message::FindValue { key } => {
-                match self.find_value(&key) {
-                    FindValueResult::Value(value) => self.send_message(&Message::ValueFound(value), src)?,
-                    FindValueResult::Nodes(nodes) => self.send_message(&Message::NodesFound(nodes), src)?,
+            Message::FindValue { key } => match self.find_value(&key) {
+                FindValueResult::Value(value) => {
+                    self.send_message(&Message::ValueFound(value), src)?;
+                    info!("Found value for key {:?} from {:#?}", key, src);
                 }
-            }
-            _ => {} // Handle other message types
+                FindValueResult::Nodes(nodes) => {
+                    self.send_message(&Message::NodesFound(nodes), src)?;
+                    info!("NodesFound for key {:?} from {:#?}", key, src);
+                }
+            },
+            _ => warn!("Received unknown message type from {:#?}", src), // Handle other message types
         }
         Ok(())
     }
 
     fn send_message(&self, message: &Message, dst: SocketAddr) -> std::io::Result<()> {
-        let serialized = serialize(message).unwrap();
+        let serialized = serialize(message).map_err(|e| {
+            error!("Failed to serialize message: {:?}", e);
+            std::io::Error::new(std::io::ErrorKind::Other, "Serialization error")
+        })?;
         self.socket.send_to(&serialized, dst)?;
+        debug!("Sent message to {:#?}", dst);
         Ok(())
     }
 
     pub fn store(&mut self, key: &[u8], value: &[u8]) {
         let hash = Self::hash_key(key);
         self.storage.insert(hash.to_vec(), value.to_vec());
-        println!("Stored value for key: {:?}", hash);
+        info!("Stored value for key: {:?}", hash);
     }
-
-    // pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-    //     let hash = Self::hash_key(key);
-    //     self.storage.get(&hash).cloned()
-    // }
 
     fn hash_key(key: &[u8]) -> Vec<u8> {
         let mut hasher = Sha256::new();
@@ -249,14 +299,21 @@ impl KademliaNode {
         self.send_message(&Message::Ping { sender: self.id }, addr)
     }
 
-    // Enhanced Client API
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> std::io::Result<()> {
         let hash = Self::hash_key(key);
         let target = NodeId(hash.try_into().unwrap());
         let nodes = self.find_node(&target);
 
         for (_, addr) in nodes.iter().take(ALPHA) {
-            self.send_message(&Message::Store { key: key.to_vec(), value: value.to_vec() }, *addr)?;
+            if let Err(e) = self.send_message(
+                &Message::Store {
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                },
+                *addr,
+            ) {
+                error!("Failed to send Store message to {:#?}: {:?}", addr, e);
+            }
         }
 
         self.store(key, value);
@@ -270,11 +327,12 @@ impl KademliaNode {
 
         let hash = Self::hash_key(key);
         let target = NodeId(hash.try_into().unwrap());
-        let mut nodes = self.find_node(&target);
+        let nodes = self.find_node(&target);
 
         for (_, addr) in nodes.iter().take(ALPHA) {
-            self.send_message(&Message::FindValue { key: key.to_vec() }, *addr)?;
-            // In a real implementation, we would wait for responses and handle them
+            if let Err(e) = self.send_message(&Message::FindValue { key: key.to_vec() }, *addr) {
+                error!("Failed to send FindValue message to {:#?}: {:?}", addr, e);
+            }
         }
 
         // For simplicity, we're just returning None here
@@ -302,6 +360,7 @@ pub enum FindValueResult {
 }
 
 fn main() -> std::io::Result<()> {
+    env_logger::init(); // Initialize the logger
     let addr: SocketAddr = "127.0.0.1:33334".parse().unwrap();
     let mut node = KademliaNode::new(addr)?;
     node.bootstrap()?;
