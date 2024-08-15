@@ -399,6 +399,7 @@ dependencies = [
  "env_logger",
  "futures",
  "hex",
+ "lazy_static",
  "log",
  "rand",
  "serde",

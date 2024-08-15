@@ -9,7 +9,7 @@
             "name": "(Test) Debug integration_tests-test_node_discovery",
             "type": "lldb",
             "request": "launch",
-            "program": "${workspaceFolder}/target/debug/deps/integration_tests-112b4aecda8f7c8f",
+            "program": "${workspaceFolder}/target/debug/deps/integration_tests-e1b6ebccfc44c3d1",
             "args": [
                 "test",
                 "test_node_discovery",
@@ -21,6 +21,24 @@
             "cwd": "${workspaceFolder}",
             "sourceLanguages": ["rust"]
         },
+        
+        {
+            "name": "(Test) Debug unit tests",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/deps/integration_tests-e1b6ebccfc44c3d1",
+            "args": [
+                "test",
+                "test_node_discovery",
+                "--test", "integration_tests",
+                "--",
+                "--nocapture",
+                "--test-threads=1"
+            ],
+            "cwd": "${workspaceFolder}",
+            "sourceLanguages": ["rust"]
+        },
+        
         // {
         //     "name": "(Test)Debug integration_tests-test_node_discovery",
         //     "type": "lldb",

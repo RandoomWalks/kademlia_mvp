@@ -19,6 +19,7 @@ tracing-subscriber = "*"
 tempfile = "3.2"
 hex="*"
 thiserror="*"
+lazy_static="*"
 
 [[bin]]
 name = "kademlia_mvp"

@@ -14,7 +14,7 @@ use tokio::time::{interval, Duration};
 
 use std::fmt;
 
-use crate::utils::{ALPHA, BOOTSTRAP_NODES, K};
+use crate::utils::{ALPHA, BOOTSTRAP_NODES, K, get_bootstrap_nodes};
 use bincode::{deserialize, serialize};
 
 /// Represents a Kademlia node in a distributed hash table (DHT).
@@ -86,47 +86,34 @@ impl KademliaNode {
     /// ```
     pub async fn bootstrap(&mut self) -> std::io::Result<()> {
         info!("Starting bootstrap process for node: {:?}", self.id);
-
-        for &bootstrap_addr in BOOTSTRAP_NODES.iter() {
-            match bootstrap_addr.parse::<SocketAddr>() {
-                Ok(addr) => {
-                    info!("Attempting to ping bootstrap node at {}", addr);
-
-                    if let Err(e) = self.ping(addr).await {
-                        error!("Failed to ping bootstrap node {}: {:?}", addr, e);
-                        continue;
-                    }
-
-                    info!(
-                        "Ping to bootstrap node {} successful. Performing node discovery...",
-                        addr
-                    );
-
-                    let discovered_nodes = self.find_node(&self.id);
-                    for (node_id, node_addr) in discovered_nodes {
-                        let distance = self.id.distance(&node_id);
-                        debug!(
-                            "Discovered node {:#?} at {} with distance {:?}",
-                            node_id, node_addr, distance
-                        );
-                        self.routing_table.update(node_id, node_addr);
-                    }
-
-                    info!(
-                        "Bootstrap successful with bootstrap node: {}",
-                        bootstrap_addr
-                    );
-                }
-                Err(e) => error!("Invalid bootstrap address {}: {:?}", bootstrap_addr, e),
+    
+        let bootstrap_nodes = get_bootstrap_nodes();
+    
+        for &bootstrap_addr in bootstrap_nodes.iter() {
+            info!("Attempting to ping bootstrap node at {}", bootstrap_addr);
+    
+            if let Err(e) = self.ping(bootstrap_addr).await {
+                error!("Failed to ping bootstrap node {}: {:?}", bootstrap_addr, e);
+                continue;
+            }
+    
+            info!(
+                "Ping to bootstrap node {} successful. Performing node discovery...",
+                bootstrap_addr
+            );
+    
+            let discovered_nodes = self.find_node(&self.id);
+            for (node_id, node_addr) in discovered_nodes {
+                let distance = self.id.distance(&node_id);
+                debug!(
+                    "Discovered node {:#?} at {} with distance {:?}",
+                    node_id, node_addr, distance
+                );
+                self.routing_table.update(node_id, node_addr);
             }
         }
-
-        if self
-            .routing_table
-            .buckets
-            .iter()
-            .all(|bucket| bucket.entries.is_empty())
-        {
+    
+        if self.routing_table.buckets.iter().all(|bucket| bucket.entries.is_empty()) {
             warn!("Bootstrap completed, but no nodes were added to the routing table.");
         } else {
             info!(
@@ -138,9 +125,10 @@ impl KademliaNode {
                     .count()
             );
         }
-
+    
         Ok(())
     }
+    
 
     /// Runs the main event loop of the node, handling incoming messages, refreshing the routing table, and
     /// checking for shutdown signals.

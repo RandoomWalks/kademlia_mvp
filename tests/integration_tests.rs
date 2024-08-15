@@ -1,6 +1,6 @@
 use kademlia_mvp::message::{Message, FindValueResult};
 use kademlia_mvp::node::KademliaNode;
-use kademlia_mvp::utils::NodeId;
+use kademlia_mvp::utils::{NodeId,get_bootstrap_nodes, load_bootstrap_nodes};
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
 use log::{debug, info};
@@ -41,13 +41,41 @@ async fn test_node_discovery() {
     debug!("============================");
     debug!("Starting test: test_node_discovery");
     debug!("============================");
+/* 
+    // ! BOOTSTRAP TODO:
+    //! Ensure Routing Table Updates:
 
-    // ! ISSUE: nodes are created with dynamically assigned ports, their addresses aren’t known or shared, causing the routing table to remain empty.
-    // ! nodes create in test do not have a preloaded routing table or a way to know about each other because they’re essentially isolated. The bootstrap process relies on a known list of bootstrap nodes (BOOTSTRAP_NODES), but since dynamically assigning ports in test and not registering those ports, the bootstrap process becomes ineffective.
+    //! After a successful ping, should update the routing table with the address and ID of the responding node. This can be done in the handle_message or ping methods.
+    //! Example logic:
 
-    let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap(); // ! OS assign random port numbers (indicated by :0). 
-    let addr2: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let addr3: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    //! rust
+    //! Copy code
+    //! if let Some(response) = self.ping(bootstrap_addr).await {
+    //!     self.routing_table.update(response.node_id, bootstrap_addr);
+    //! }
+    //! Verify Node Propagation:
+
+    //! When performing the find_node operation, ensure that the node propagates information about other known nodes. This is key for building a decentralized network where nodes gradually learn about each other.
+    //! Check Routing Table Logic:
+
+    //! Review RoutingTable implementation and confirm that it correctly handles the insertion of nodes and performs lookups according to Kademlia’s XOR metric.
+    //! Test the Routing Table Population Directly:
+
+    //! Consider adding debug logs or assertions within test to confirm whether nodes are being correctly added to the routing table after each ping.
+ */
+
+    // Define fixed ports for testing
+    let addr1: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+    let addr2: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+    let addr3: SocketAddr = "127.0.0.1:5002".parse().unwrap();
+
+    // Load the bootstrap nodes
+    load_bootstrap_nodes(vec![
+        addr1.to_string(),
+        addr2.to_string(),
+        addr3.to_string(),
+    ]);
+
 
     let (mut node1, _) = KademliaNode::new(addr1).await.unwrap();
     let (mut node2, _) = KademliaNode::new(addr2).await.unwrap();
