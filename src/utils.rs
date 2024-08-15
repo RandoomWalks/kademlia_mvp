@@ -5,11 +5,11 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fmt;
 use std::net::SocketAddr; // `SocketAddr` represents a socket address with both an IP address and a port.
-use std::sync::{Mutex, Once}; // `Once` ensures that a block of code runs only once 
+use std::sync::{Mutex, Once}; // `Once` ensures that a block of code runs only once
 
 pub const K: usize = 20; // Maximum number of nodes in a k-bucket
 pub const ALPHA: usize = 3; // Number of parallel lookups
-// pub const BOOTSTRAP_NODES: [&str; 1] = ["127.0.0.1:33333"]; // Hardcoded bootstrap node
+                            // pub const BOOTSTRAP_NODES: [&str; 1] = ["127.0.0.1:33333"]; // Hardcoded bootstrap node
 
 /// Struct representing a unique identifier for a node in the network.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -74,6 +74,27 @@ impl NodeId {
             result[i] = self.0[i] ^ other.0[i]; // XOR each byte to calculate distance
         }
         NodeId(result)
+    }
+
+    /// Calculates the XOR distance between two node IDs.
+    pub fn distance_slice(&self, other: &NodeId) -> [u8; 32] {
+        let mut dist = [0u8; 32];
+        for i in 0..32 {
+            dist[i] = self.0[i] ^ other.0[i];
+        }
+        dist
+    }
+
+    /// Calculates the number of leading zeros in the XOR distance.
+    pub fn leading_zeros(&self, other: &NodeId) -> u32 {
+        let distance = self.distance_slice(other);
+        distance.iter().fold(0, |acc, &byte| {
+            if byte == 0 {
+                acc + 8 // Each byte has 8 bits
+            } else {
+                acc + byte.leading_zeros() - 8 // Count leading zeros in the first non-zero byte
+            }
+        })
     }
 
     /// Creates a `NodeId` from a 32-byte slice.

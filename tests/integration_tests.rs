@@ -1,18 +1,17 @@
-use kademlia_mvp::message::{Message, FindValueResult};
+use kademlia_mvp::message::{FindValueResult, Message};
 use kademlia_mvp::node::KademliaNode;
-use kademlia_mvp::utils::{NodeId,get_bootstrap_nodes, load_bootstrap_nodes};
+use kademlia_mvp::utils::{get_bootstrap_nodes, load_bootstrap_nodes, NodeId};
+use log::{debug, info};
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
-use log::{debug, info};
-
 
 // CMD TO RUN ALL TESTS(unit/intg) W/ CLEAR DEBUG OUTPUT
 // $ RUST_LOG=debug cargo test  -- --nocapture  --test-threads=1
 
-// Specifiy single test file 
+// Specifiy single test file
 // $ RUST_LOG=debug cargo test --test integration_tests  -- --nocapture  --test-threads=1
 
-// Specifiy single test in single test file 
+// Specifiy single test in single test file
 // $ RUST_LOG=debug cargo test test_node_discovery --test integration_tests  -- --nocapture  --test-threads=1
 
 // Specifiy single test in single test file w/ backtrace output
@@ -41,28 +40,28 @@ async fn test_node_discovery() {
     debug!("============================");
     debug!("Starting test: test_node_discovery");
     debug!("============================");
-/* 
-    // ! BOOTSTRAP TODO:
-    //! Ensure Routing Table Updates:
+    /*
+       // ! BOOTSTRAP TODO:
+       //! Ensure Routing Table Updates:
 
-    //! After a successful ping, should update the routing table with the address and ID of the responding node. This can be done in the handle_message or ping methods.
-    //! Example logic:
+       //! After a successful ping, should update the routing table with the address and ID of the responding node. This can be done in the handle_message or ping methods.
+       //! Example logic:
 
-    //! rust
-    //! Copy code
-    //! if let Some(response) = self.ping(bootstrap_addr).await {
-    //!     self.routing_table.update(response.node_id, bootstrap_addr);
-    //! }
-    //! Verify Node Propagation:
+       //! rust
+       //! Copy code
+       //! if let Some(response) = self.ping(bootstrap_addr).await {
+       //!     self.routing_table.update(response.node_id, bootstrap_addr);
+       //! }
+       //! Verify Node Propagation:
 
-    //! When performing the find_node operation, ensure that the node propagates information about other known nodes. This is key for building a decentralized network where nodes gradually learn about each other.
-    //! Check Routing Table Logic:
+       //! When performing the find_node operation, ensure that the node propagates information about other known nodes. This is key for building a decentralized network where nodes gradually learn about each other.
+       //! Check Routing Table Logic:
 
-    //! Review RoutingTable implementation and confirm that it correctly handles the insertion of nodes and performs lookups according to Kademlia’s XOR metric.
-    //! Test the Routing Table Population Directly:
+       //! Review RoutingTable implementation and confirm that it correctly handles the insertion of nodes and performs lookups according to Kademlia’s XOR metric.
+       //! Test the Routing Table Population Directly:
 
-    //! Consider adding debug logs or assertions within test to confirm whether nodes are being correctly added to the routing table after each ping.
- */
+       //! Consider adding debug logs or assertions within test to confirm whether nodes are being correctly added to the routing table after each ping.
+    */
 
     // Define fixed ports for testing
     let addr1: SocketAddr = "127.0.0.1:5000".parse().unwrap();
@@ -76,11 +75,10 @@ async fn test_node_discovery() {
         addr3.to_string(),
     ]);
 
-
     let (mut node1, _) = KademliaNode::new(addr1).await.unwrap();
     let (mut node2, _) = KademliaNode::new(addr2).await.unwrap();
     let (mut node3, _) = KademliaNode::new(addr3).await.unwrap();
-    
+
     node2.bootstrap().await.unwrap();
     debug!("node2 contents: {:#?}", node2);
     node3.bootstrap().await.unwrap();
@@ -92,7 +90,33 @@ async fn test_node_discovery() {
     // debug!("Discovered nodes: {:?}", nodes);
 
     // assert!(nodes.iter().any(|(node_id, _)| *node_id == node3.id));
-    
+
+    // Check that the routing tables have been populated
+    assert!(
+        !node2
+            .routing_table
+            .buckets
+            .iter()
+            .all(|bucket| bucket.entries.is_empty()),
+        "Node2's routing table is empty after bootstrap!"
+    );
+    assert!(
+        !node3
+            .routing_table
+            .buckets
+            .iter()
+            .all(|bucket| bucket.entries.is_empty()),
+        "Node3's routing table is empty after bootstrap!"
+    );
+
+    // Perform node discovery and check results
+    let target_id = node3.id;
+    let nodes = node1.find_node(&target_id);
+    assert!(
+        nodes.iter().any(|(node_id, _)| *node_id == node3.id),
+        "Node1 did not discover Node3!"
+    );
+
     debug!("============================");
     debug!("Completed test: test_node_discovery");
     debug!("============================");

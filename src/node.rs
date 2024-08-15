@@ -102,6 +102,9 @@ impl KademliaNode {
                 bootstrap_addr
             );
     
+            // Update routing table with the bootstrap node after successful ping
+            self.routing_table.update(self.id.clone(), bootstrap_addr);
+    
             let discovered_nodes = self.find_node(&self.id);
             for (node_id, node_addr) in discovered_nodes {
                 let distance = self.id.distance(&node_id);
@@ -113,7 +116,12 @@ impl KademliaNode {
             }
         }
     
-        if self.routing_table.buckets.iter().all(|bucket| bucket.entries.is_empty()) {
+        if self
+            .routing_table
+            .buckets
+            .iter()
+            .all(|bucket| bucket.entries.is_empty())
+        {
             warn!("Bootstrap completed, but no nodes were added to the routing table.");
         } else {
             info!(
@@ -128,6 +136,7 @@ impl KademliaNode {
     
         Ok(())
     }
+    
     
 
     /// Runs the main event loop of the node, handling incoming messages, refreshing the routing table, and
@@ -324,25 +333,30 @@ impl KademliaNode {
             "Starting find_node for target {:?} from node {:?}",
             target, self.id
         );
-
+    
         let closest_nodes = self.routing_table.find_closest(target, K);
-
+    
+        // Send requests to closest nodes to gather more information
         for (node_id, addr) in &closest_nodes {
             let distance = target.distance(node_id);
             debug!(
                 "Found node {:?} at {} with distance {:?} from target {:?}",
                 node_id, addr, distance, target
             );
+            
+            // This part assumes a recursive or iterative search where nodes return their known closest nodes
+            let _ = self.send_message(&Message::FindNode { target: target.clone() }, *addr);
         }
-
+    
         info!(
             "find_node for target {:?} found {} closest nodes.",
             target,
             closest_nodes.len()
         );
-
+    
         closest_nodes
     }
+    
 
     /// Finds a value in the local storage or returns the closest nodes if the value is not found.
     ///
