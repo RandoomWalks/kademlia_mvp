@@ -1,0 +1,53 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "(Test) Debug integration_tests-test_node_discovery",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/deps/integration_tests-112b4aecda8f7c8f",
+            "args": [
+                "test",
+                "test_node_discovery",
+                "--test", "integration_tests",
+                "--",
+                "--nocapture",
+                "--test-threads=1"
+            ],
+            "cwd": "${workspaceFolder}",
+            "sourceLanguages": ["rust"]
+        },
+        // {
+        //     "name": "(Test)Debug integration_tests-test_node_discovery",
+        //     "type": "lldb",
+        //     "request": "launch",
+        //     "cargo": {
+        //         "args": [
+        //             "test",
+        //             "test_node_discovery",
+        //             "--test", "integration_tests",
+        //             "--",
+        //             "--nocapture",
+        //             "--test-threads=1"
+        //         ],
+        //         "filter": {
+        //             "name": "integration_tests",
+        //             "kind": "test"
+        //         }
+        //     },
+        //     "env": {
+        //         "CARGO_TERM_JSON": "false"
+        //     },
+        //     "cwd": "${workspaceFolder}",
+        //     "sourceLanguages": ["rust"]
+        // },
+        
+        
+        
+        
+    ]
+}
