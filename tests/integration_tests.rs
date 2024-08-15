@@ -42,7 +42,10 @@ async fn test_node_discovery() {
     debug!("Starting test: test_node_discovery");
     debug!("============================");
 
-    let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    // ! ISSUE: nodes are created with dynamically assigned ports, their addresses aren’t known or shared, causing the routing table to remain empty.
+    // ! nodes create in test do not have a preloaded routing table or a way to know about each other because they’re essentially isolated. The bootstrap process relies on a known list of bootstrap nodes (BOOTSTRAP_NODES), but since dynamically assigning ports in test and not registering those ports, the bootstrap process becomes ineffective.
+
+    let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap(); // ! OS assign random port numbers (indicated by :0). 
     let addr2: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let addr3: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -61,7 +64,7 @@ async fn test_node_discovery() {
     // debug!("Discovered nodes: {:?}", nodes);
 
     // assert!(nodes.iter().any(|(node_id, _)| *node_id == node3.id));
-
+    
     debug!("============================");
     debug!("Completed test: test_node_discovery");
     debug!("============================");

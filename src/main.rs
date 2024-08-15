@@ -3,8 +3,6 @@ pub mod routing_table;
 pub mod kbucket;
 pub mod message;
 pub mod utils;
-pub mod cache_prac;
-pub mod KVStore;
 
 use log::{info, warn, debug, error};
 

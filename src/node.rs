@@ -85,19 +85,60 @@ impl KademliaNode {
     /// node.bootstrap().await.unwrap();
     /// ```
     pub async fn bootstrap(&mut self) -> std::io::Result<()> {
+        info!("Starting bootstrap process for node: {:?}", self.id);
+
         for &bootstrap_addr in BOOTSTRAP_NODES.iter() {
             match bootstrap_addr.parse::<SocketAddr>() {
                 Ok(addr) => {
+                    info!("Attempting to ping bootstrap node at {}", addr);
+
                     if let Err(e) = self.ping(addr).await {
-                        error!(
-                            "Failed to ping bootstrap node {:#?}: {:?}",
-                            bootstrap_addr, e
-                        );
+                        error!("Failed to ping bootstrap node {}: {:?}", addr, e);
+                        continue;
                     }
+
+                    info!(
+                        "Ping to bootstrap node {} successful. Performing node discovery...",
+                        addr
+                    );
+
+                    let discovered_nodes = self.find_node(&self.id);
+                    for (node_id, node_addr) in discovered_nodes {
+                        let distance = self.id.distance(&node_id);
+                        debug!(
+                            "Discovered node {:#?} at {} with distance {:?}",
+                            node_id, node_addr, distance
+                        );
+                        self.routing_table.update(node_id, node_addr);
+                    }
+
+                    info!(
+                        "Bootstrap successful with bootstrap node: {}",
+                        bootstrap_addr
+                    );
                 }
-                Err(e) => error!("Invalid bootstrap address {:#?}: {:?}", bootstrap_addr, e),
+                Err(e) => error!("Invalid bootstrap address {}: {:?}", bootstrap_addr, e),
             }
         }
+
+        if self
+            .routing_table
+            .buckets
+            .iter()
+            .all(|bucket| bucket.entries.is_empty())
+        {
+            warn!("Bootstrap completed, but no nodes were added to the routing table.");
+        } else {
+            info!(
+                "Bootstrap completed. Routing table now contains nodes in {} buckets.",
+                self.routing_table
+                    .buckets
+                    .iter()
+                    .filter(|bucket| !bucket.entries.is_empty())
+                    .count()
+            );
+        }
+
         Ok(())
     }
 
@@ -160,52 +201,63 @@ impl KademliaNode {
     /// let message = Message::Ping { sender: NodeId::new() };
     /// node.handle_message(message, "127.0.0.1:8080".parse().unwrap()).await.unwrap();
     /// ```
-    pub async fn handle_message(&mut self, message: Message, src: SocketAddr) -> std::io::Result<()> {
+    pub async fn handle_message(
+        &mut self,
+        message: Message,
+        src: SocketAddr,
+    ) -> std::io::Result<()> {
+        debug!("Received message from {}: {:?}", src, message);
+
         match message {
             Message::Ping { sender } => {
+                info!(
+                    "Received Ping from {} (Node ID: {:?}). Responding with Pong.",
+                    src, sender
+                );
                 self.routing_table.update(sender, src);
                 self.send_message(&Message::Pong { sender: self.id }, src)
-                    .await?; // - Sends back a Pong response to confirm the node is active.
-
-                info!("Received Ping from {:#?}, responded with Pong", src);
+                    .await?;
             }
             Message::Pong { sender } => {
-                self.routing_table.update(sender, src); // - Updates the routing table with the sender's NodeId and address.
-
-                info!("Received Pong from {:#?}", src);
+                info!("Received Pong from {} (Node ID: {:?}).", src, sender);
+                self.routing_table.update(sender, src);
             }
             Message::Store { key, value } => {
+                info!("Storing value for key {:?} from node {}", key, src);
                 self.store(&key, &value);
                 self.send_message(&Message::Stored, src).await?;
-                info!("Stored value for key {:?} from {:#?}", key, src);
             }
-            // Handles a FindNode request:
-            // - Searches for the closest nodes to the target NodeId in the routing table.
-            // - Sends the found nodes back to the requester as a NodesFound message.
             Message::FindNode { target } => {
                 let nodes = self.find_node(&target);
-                self.send_message(&Message::NodesFound(nodes), src).await?;
                 info!(
-                    "Received FindNode from {:#?}, responded with NodesFound",
-                    src
+                    "Received FindNode request from {} (Target: {:?}). Responding with {} nodes.",
+                    src,
+                    target,
+                    nodes.len()
                 );
+                self.send_message(&Message::NodesFound(nodes), src).await?;
             }
-            // Handles a FindValue request:
-            // - First checks if the value for the given key is stored locally.
-            // - If found, sends the value back as a ValueFound message.
-            // - If not found, sends back the closest nodes as a NodesFound message.
             Message::FindValue { key } => match self.find_value(&key) {
                 FindValueResult::Value(value) => {
+                    info!(
+                        "Found value for key {:?}. Responding to {} with ValueFound.",
+                        key, src
+                    );
                     self.send_message(&Message::ValueFound(value), src).await?;
-                    info!("Found value for key {:?} from {:#?}", key, src);
                 }
                 FindValueResult::Nodes(nodes) => {
+                    info!(
+                        "Value not found for key {:?}. Responding to {} with {} nodes.",
+                        key,
+                        src,
+                        nodes.len()
+                    );
                     self.send_message(&Message::NodesFound(nodes), src).await?;
-                    info!("NodesFound for key {:?} from {:#?}", key, src);
                 }
             },
-            _ => warn!("Received unknown message type from {:#?}", src),
+            _ => warn!("Received unknown message type from {}", src),
         }
+
         Ok(())
     }
 
@@ -280,7 +332,28 @@ impl KademliaNode {
     /// let closest_nodes = node.find_node(&target_node);
     /// ```
     pub fn find_node(&self, target: &NodeId) -> Vec<(NodeId, SocketAddr)> {
-        self.routing_table.find_closest(target, K)
+        debug!(
+            "Starting find_node for target {:?} from node {:?}",
+            target, self.id
+        );
+
+        let closest_nodes = self.routing_table.find_closest(target, K);
+
+        for (node_id, addr) in &closest_nodes {
+            let distance = target.distance(node_id);
+            debug!(
+                "Found node {:?} at {} with distance {:?} from target {:?}",
+                node_id, addr, distance, target
+            );
+        }
+
+        info!(
+            "find_node for target {:?} found {} closest nodes.",
+            target,
+            closest_nodes.len()
+        );
+
+        closest_nodes
     }
 
     /// Finds a value in the local storage or returns the closest nodes if the value is not found.
@@ -346,13 +419,22 @@ impl KademliaNode {
     /// ```
     pub async fn put(&mut self, key: &[u8], value: &[u8]) -> std::io::Result<()> {
         let hash = Self::hash_key(key);
-        let hash_array: [u8; 32] = hash[..].try_into().expect("Hash length is not 32 bytes"); // Converts the `hash` (which is a `Vec<u8>` of SHA-256 hash bytes) into a fixed-size array of 32 bytes.  If `hash` is not exactly 32 bytes, the `expect` call will panic
-
+        let hash_array: [u8; 32] = hash[..].try_into().expect("Hash length is not 32 bytes");
         let target = NodeId::from_slice(&hash_array);
+
+        info!(
+            "Storing value for key {:?} (hashed as {:?}) at node {:?}",
+            key, hash, self.id
+        );
 
         let nodes = self.find_node(&target);
 
-        for (_, addr) in nodes.iter().take(ALPHA) {
+        for (node_id, addr) in nodes.iter().take(ALPHA) {
+            debug!(
+                "Sending Store message to node {:?} at {} for key {:?}",
+                node_id, addr, key
+            );
+
             if let Err(e) = self
                 .send_message(
                     &Message::Store {
@@ -363,11 +445,24 @@ impl KademliaNode {
                 )
                 .await
             {
-                error!("Failed to send Store message to {:#?}: {:?}", addr, e);
+                error!(
+                    "Failed to send Store message to node {:?} at {}: {:?}",
+                    node_id, addr, e
+                );
+            } else {
+                info!(
+                    "Successfully sent Store message to node {:?} at {}",
+                    node_id, addr
+                );
             }
         }
 
         self.store(key, value);
+        info!(
+            "Value for key {:?} (hashed as {:?}) successfully stored locally at node {:?}",
+            key, hash, self.id
+        );
+
         Ok(())
     }
 
@@ -390,30 +485,61 @@ impl KademliaNode {
     /// }
     /// ```
     pub async fn get(&mut self, key: &[u8]) -> std::io::Result<Option<Vec<u8>>> {
-        if let Some(value) = self.storage.get(&Self::hash_key(key)) {
+        let hash = Self::hash_key(key);
+        let hash_array: [u8; 32] = hash[..].try_into().expect("Hash length is not 32 bytes");
+        let target = NodeId::from_slice(&hash_array);
+    
+        info!(
+            "Attempting to retrieve value for key {:?} (hashed as {:?}) from node {:?}",
+            key, hash, self.id
+        );
+    
+        if let Some(value) = self.storage.get(&hash) {
+            info!(
+                "Value found locally for key {:?} (hashed as {:?}) at node {:?}",
+                key, hash, self.id
+            );
             return Ok(Some(value.clone()));
         }
-
-        let hash = Self::hash_key(key);
-        let hash_array: [u8; 32] = hash[..].try_into().expect("Hash length is not 32 bytes"); // Converts the `hash` (which is a `Vec<u8>` of SHA-256 hash bytes) into a fixed-size array of 32 bytes.
-
-        let target = NodeId::from_slice(&hash_array);
-
+    
         let nodes = self.find_node(&target);
-
-        for (_, addr) in nodes.iter().take(ALPHA) {
+    
+        info!(
+            "Value not found locally. Querying {} nodes for key {:?} (hashed as {:?}).",
+            nodes.len(),
+            key,
+            hash
+        );
+    
+        for (node_id, addr) in nodes.iter().take(ALPHA) {
+            debug!(
+                "Sending FindValue message to node {:?} at {} for key {:?}",
+                node_id, addr, key
+            );
+    
             if let Err(e) = self
                 .send_message(&Message::FindValue { key: key.to_vec() }, *addr)
                 .await
             {
-                error!("Failed to send FindValue message to {:#?}: {:?}", addr, e);
+                error!(
+                    "Failed to send FindValue message to node {:?} at {}: {:?}",
+                    node_id, addr, e
+                );
+            } else {
+                info!("Successfully sent FindValue message to node {:?} at {}", node_id, addr);
             }
         }
-
+    
+        info!(
+            "No immediate value found for key {:?} (hashed as {:?}). Awaiting responses from queried nodes.",
+            key, hash
+        );
+    
         // For simplicity, we're returning None here. In a complete implementation,
         // this method would wait for responses from the nodes and return the value if found.
         Ok(None)
     }
+    
 
     /// Refreshes the buckets in the routing table by ensuring that at least one node is active in each bucket.
     ///
