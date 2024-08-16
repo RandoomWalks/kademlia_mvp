@@ -94,10 +94,28 @@ impl<K: Eq + Hash + Clone + 'static + Send + Sync> CachePolicy<K> for LRUCachePo
     }
 }
 
-// Enum defining different eviction policies.
+pub struct CacheConfig {
+    pub eviction_policy: EvictionPolicy,
+    pub ttl: Duration,
+    pub max_size: usize,
+    pub maintenance_interval: Duration,
+}
+
 pub enum EvictionPolicy {
-    LRU, // Least Recently Used policy.
-    // Placeholder for additional strategies like LFU (Least Frequently Used) or Time-based eviction.
+    LRU,
+    LFU,
+    FIFO,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        CacheConfig {
+            eviction_policy: EvictionPolicy::LRU,
+            ttl: Duration::from_secs(3600),
+            max_size: 10000,
+            maintenance_interval: Duration::from_secs(3600),
+        }
+    }
 }
 
 impl EvictionPolicy {
@@ -107,6 +125,7 @@ impl EvictionPolicy {
     pub fn build<K: Eq + Hash + Clone + 'static  + Send + Sync>(&self) -> Box<dyn CachePolicy<K>> {
         match self {
             EvictionPolicy::LRU => Box::new(LRUCachePolicy::new()),
+            _ => Box::new(LRUCachePolicy::new()),
         }
     }
 }

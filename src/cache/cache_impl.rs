@@ -6,6 +6,7 @@ use tokio::sync::RwLock;
 
 use super::entry::CacheEntry;
 use super::policy::CachePolicy;
+use super::policy;
 
 use std::fmt;
 
@@ -40,16 +41,19 @@ where
 {
     // The actual store of cached entries, protected by a read-write lock.
     // This allows multiple readers or one writer at a time.
-    cache_store: RwLock<HashMap<K, CacheEntry<V>>>,
+    pub cache_store: RwLock<HashMap<K, CacheEntry<V>>>,
 
     // The eviction policy for cache entries, stored as a boxed trait object.
     // Access to the policy is protected by a read-write lock.
-    policy: Arc<RwLock<Box<dyn CachePolicy<K>>>>,
+    pub policy: Arc<RwLock<Box<dyn CachePolicy<K>>>>,
 
     // Metrics tracking cache hits, misses, and evictions, protected by a read-write lock.
-    metrics: Arc<RwLock<CacheMetrics>>,
+    pub metrics: Arc<RwLock<CacheMetrics>>,
 
-    capacity: usize, // New field to store the maximum capacity of the cache
+    pub capacity: usize, // New field to store the maximum capacity of the cache
+
+    pub eviction_timer: Duration,
+
 }
 
 impl<K, V> Cache<K, V>
@@ -68,6 +72,23 @@ where
             policy: Arc::new(RwLock::new(policy)),
             metrics: Arc::new(RwLock::new(CacheMetrics::new())),
             capacity, // Initialize the capacity,
+            eviction_timer: Duration::from_secs(60),
+
+        }
+    }
+
+    pub fn with_config(config: &policy::CacheConfig) -> Self {
+        let policy = match config.eviction_policy {
+            policy::EvictionPolicy::LRU => Box::new(policy::LRUCachePolicy::new()),
+            _ => Box::new(policy::LRUCachePolicy::new()),
+        };
+        
+        Self {
+            cache_store: RwLock::new(HashMap::with_capacity(config.max_size)),
+            policy: Arc::new(RwLock::new(policy)),
+            metrics: Arc::new(RwLock::new(CacheMetrics::new())),
+            capacity: config.max_size,
+            eviction_timer: config.ttl,
         }
     }
 
@@ -155,9 +176,9 @@ where
 
 // Represents metrics tracking for cache operations.
 pub struct CacheMetrics {
-    hits: usize,
-    misses: usize,
-    evictions: usize,
+    pub hits: usize,
+    pub misses: usize,
+    pub evictions: usize,
 }
 
 impl CacheMetrics {

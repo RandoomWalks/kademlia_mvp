@@ -34,6 +34,8 @@ pub struct KademliaNode {
     pub shutdown: mpsc::Receiver<()>,       // Channel receiver for shutdown signals
 
     pub cache: cache_impl::Cache<Vec<u8>, Vec<u8>>,
+    pub cache_config: policy::CacheConfig,
+
 }
 
 impl fmt::Debug for KademliaNode {
@@ -63,11 +65,15 @@ impl KademliaNode {
     /// let addr = "127.0.0.1:8080".parse().unwrap();
     /// let (node, shutdown_sender) = KademliaNode::new(addr).await.unwrap();
     /// ```
-    pub async fn new(addr: SocketAddr) -> std::io::Result<(Self, mpsc::Sender<()>)> {
+    
+    pub async fn new(addr: SocketAddr, cache_config: Option<policy::CacheConfig>) -> std::io::Result<(Self, mpsc::Sender<()>)> {
         let id = NodeId::new();
         let socket = UdpSocket::bind(addr).await?;
         let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
 
+        let config = cache_config.unwrap_or_default();
+        let cache: cache_impl::Cache<Vec<u8>, Vec<u8>> = cache_impl::Cache::with_config(&config);
+        
         Ok((
             KademliaNode {
                 id: id.clone(),
@@ -77,11 +83,33 @@ impl KademliaNode {
                 socket: Arc::new(socket),
                 shutdown: shutdown_receiver,
                 cache: cache_impl::Cache::with_policy(policy::EvictionPolicy::LRU,10),
+                cache_config: config,
+
             },
             shutdown_sender,
         ))
     }
 
+    async fn start_cache_maintenance(&self) {
+        let mut interval = tokio::time::interval(Duration::from_secs(3600)); // Run every hour
+        loop {
+            interval.tick().await;
+            debug!("Performing cache maintenance");
+            if let Err(e) = self.cache.evict().await {
+                warn!("Error during cache eviction: {:?}", e);
+            }
+        }
+    }
+    
+    pub async  fn cache_hit_count(&self) -> usize {
+        // Return the cache hit count from your metrics
+        self.cache.metrics.read().await.hits
+    }
+    
+    pub async  fn cache_size(&self) -> usize {
+        // Return the current size of the cache
+        self.cache.cache_store.read().await.len()
+    }
     /// Bootstraps the node by pinging a list of predefined bootstrap nodes.
     ///
     /// **Input:** None
