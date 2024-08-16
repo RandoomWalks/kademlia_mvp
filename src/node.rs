@@ -95,9 +95,9 @@ impl KademliaNode {
         loop {
             interval.tick().await;
             debug!("Performing cache maintenance");
-            if let Err(e) = self.cache.evict().await {
-                warn!("Error during cache eviction: {:?}", e);
-            }
+            // if let Err(e) = self.cache.evict().await {
+            //     warn!("Error during cache eviction: {:?}", e);
+            // }
         }
     }
     
@@ -216,8 +216,41 @@ impl KademliaNode {
                 info!("Received Pong from {:#?}", src);
             }
             Message::Store { key, value } => {
-                self.store(&key, &value).await;
+                // TODO: Find k closest nodes to myself (as opposed to the key of the storvalue)
+                let hash = Self::hash_key(&key);
+                // let target = NodeId::from_slice(&hash);
+                
+                // let sli_mut = hash.as_ref();
+                let sli_mut: &[u8] = hash.as_slice();
+                let fixed_sli:[u8; 32] = sli_mut.try_into().unwrap();
+                // let sli:[u8;32] = hash.iter().map(|&i| i as u8).try_into().unwrap();
+
+                // let hash_array: NodeId = hash[..].try_into().expect("Hash length is not 32 bytes"); // Converts the `hash` (which is a `Vec<u8>` of SHA-256 hash bytes) into a fixed-size array of 32 bytes.
+                
+                // let fixed_len_sli:NodeId = sli_mut.try_into();
+
+
+                let k = 3;
+                let n = NodeId(fixed_sli);
+
+                let closest_nodes = self.routing_table.find_closest(&n , k);
+
+                // Storing locally if we're one of the k closest
+                for (node_id, addr) in closest_nodes {
+                    // check not self
+                    if node_id != self.id {
+                        // send rpc
+                        self.send_message(&Message::Store { key: key.clone(), value: value.clone() }, addr).await?;
+                    }
+                }
                 self.send_message(&Message::Stored, src).await?;
+
+                // TODO: Send STORE RPCs to each of these k nodes.
+
+
+                
+                // self.store(&key, &value).await;
+                // self.send_message(&Message::Stored, src).await?;
                 info!("Stored value for key {:?} from {:#?}", key, src);
             }
             // Handles a FindNode request:
