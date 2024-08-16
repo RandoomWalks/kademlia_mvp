@@ -2,8 +2,10 @@ use crate::message::{FindValueResult, Message};
 use crate::routing_table::RoutingTable;
 use crate::utils::NodeId;
 
-use crate::cache::cache_impl::Cache;
-
+use crate::cache::cache_impl;
+use crate::cache::entry;
+use crate::cache::policy;
+// use crate::cache::cache_impl::Cache;
 
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -30,6 +32,8 @@ pub struct KademliaNode {
     pub storage: HashMap<Vec<u8>, Vec<u8>>, // Key-value storage for the node
     pub socket: Arc<UdpSocket>,             // UDP socket for communication
     pub shutdown: mpsc::Receiver<()>,       // Channel receiver for shutdown signals
+
+    pub cache: cache_impl::Cache<Vec<u8>, Vec<u8>>,
 }
 
 impl fmt::Debug for KademliaNode {
@@ -72,6 +76,7 @@ impl KademliaNode {
                 storage: HashMap::new(),
                 socket: Arc::new(socket),
                 shutdown: shutdown_receiver,
+                cache: cache_impl::Cache::with_policy(policy::EvictionPolicy::LRU,10),
             },
             shutdown_sender,
         ))
@@ -164,7 +169,11 @@ impl KademliaNode {
     /// let message = Message::Ping { sender: NodeId::new() };
     /// node.handle_message(message, "127.0.0.1:8080".parse().unwrap()).await.unwrap();
     /// ```
-    pub async fn handle_message(&mut self, message: Message, src: SocketAddr) -> std::io::Result<()> {
+    pub async fn handle_message(
+        &mut self,
+        message: Message,
+        src: SocketAddr,
+    ) -> std::io::Result<()> {
         match message {
             Message::Ping { sender } => {
                 self.routing_table.update(sender, src);
@@ -248,9 +257,19 @@ impl KademliaNode {
     /// ```rust
     /// node.store(b"example_key", b"example_value");
     /// ```
-    pub fn store(&mut self, key: &[u8], value: &[u8]) {
+    pub async fn store(&mut self, key: &[u8], value: &[u8]) {
         let hash = Self::hash_key(key);
         self.storage.insert(hash.to_vec(), value.to_vec());
+        
+        // self.cache
+        //     .put(hash.to_vec(), value.to_vec(), Duration::from_secs(3600));
+        // Add this block to store in cache
+        if let Err(e) = self
+            .cache
+            .put(hash.to_vec(), value.to_vec(), Duration::from_secs(3600)).await
+        {
+            error!("Failed to store in cache: {:?}", e);
+        }
         info!("Stored value for key: {:?}", hash);
     }
 
@@ -334,7 +353,7 @@ impl KademliaNode {
     }
 
     /// Stores a key-value pair in the local storage and informs nearby nodes.
-    ///
+    /// method is used when you want to ensure the key-value pair is stored across the network, not just locally
     /// **Input:**
     /// - `key`: The key as a byte slice to store.
     /// - `value`: The value as a byte slice to store.
