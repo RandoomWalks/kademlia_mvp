@@ -188,7 +188,7 @@ impl KademliaNode {
                 info!("Received Pong from {:#?}", src);
             }
             Message::Store { key, value } => {
-                self.store(&key, &value);
+                self.store(&key, &value).await;
                 self.send_message(&Message::Stored, src).await?;
                 info!("Stored value for key {:?} from {:#?}", key, src);
             }
@@ -280,7 +280,7 @@ impl KademliaNode {
     ///
     /// **Output:** +
     /// - Returns a byte vector representing the hashed key.
-    ///
+    ///  SHA-256 always produces a fixed-size output of 256 bits, which is equivalent to 32 bytes.
     /// Example:
     /// ```rust
     /// let hash = KademliaNode::hash_key(b"example_key");
@@ -389,7 +389,7 @@ impl KademliaNode {
                 error!("Failed to send Store message to {:#?}: {:?}", addr, e);
             }
         }
-
+        
         self.store(key, value);
         Ok(())
     }
@@ -413,14 +413,35 @@ impl KademliaNode {
     /// }
     /// ```
     pub async fn get(&mut self, key: &[u8]) -> std::io::Result<Option<Vec<u8>>> {
-        if let Some(value) = self.storage.get(&Self::hash_key(key)) {
+        //! Network Lookup: The current implementation of get() doesn't actually perform a complete network lookup. It only checks the cache and local storage, then initiates a network lookup without waiting for the results. This means that the None case in the new code doesn't truly represent "not found in the network", but rather "not found locally".
+
+        
+        let hash = Self::hash_key(key);
+        
+        // Try to get from cache first
+        if let Ok(value) = self.cache.get(&hash).await {
+            debug!("Cache hit for key: {:?}", hash);
+            return Ok(Some(value));
+        }
+        
+        // If not in cache, check local storage
+        if let Some(value) = self.storage.get(&hash) {
+            debug!("Storage hit for key: {:?}", hash);
+            // Store in cache for future use
+            if let Err(e) = self.cache.put(hash.clone(), value.clone(), Duration::from_secs(3600)).await {
+                warn!("Failed to store in cache: {:?}", e);
+            }
             return Ok(Some(value.clone()));
         }
 
-        let hash = Self::hash_key(key);
-        let hash_array: [u8; 32] = hash[..].try_into().expect("Hash length is not 32 bytes"); // Converts the `hash` (which is a `Vec<u8>` of SHA-256 hash bytes) into a fixed-size array of 32 bytes.
+        debug!("Key not found locally, performing network lookup: {:?}", hash);
+        // Perform network lookup (existing code)
+        
+        // taking the first 32 byte and
+        //  convert the slice &hash[..32] into a fixed-size array [u8; 32].
+        let res:&[u8; 32] = &hash[..32].try_into().expect("Slice with incorrect length");
 
-        let target = NodeId::from_slice(&hash_array);
+        let target = NodeId::from_slice(res);
 
         let nodes = self.find_node(&target);
 
@@ -429,12 +450,13 @@ impl KademliaNode {
                 .send_message(&Message::FindValue { key: key.to_vec() }, *addr)
                 .await
             {
-                error!("Failed to send FindValue message to {:#?}: {:?}", addr, e);
+                warn!("Failed to send FindValue message to {:#?}: {:?}", addr, e);
             }
         }
 
-        // For simplicity, we're returning None here. In a complete implementation,
-        // this method would wait for responses from the nodes and return the value if found.
+        // Note: This is a simplification. In a complete implementation,
+        // you would wait for responses and return the value if found.
+        // For now, we'll just return None to indicate the value wasn't found locally.
         Ok(None)
     }
 
