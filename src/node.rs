@@ -207,7 +207,7 @@ impl KademliaNode {
             // - First checks if the value for the given key is stored locally.
             // - If found, sends the value back as a ValueFound message.
             // - If not found, sends back the closest nodes as a NodesFound message.
-            Message::FindValue { key } => match self.find_value(&key) {
+            Message::FindValue { key } => match self.find_value(&key).await {
                 FindValueResult::Value(value) => {
                     self.send_message(&Message::ValueFound(value), src).await?;
                     info!("Found value for key {:?} from {:#?}", key, src);
@@ -322,7 +322,7 @@ impl KademliaNode {
     ///     FindValueResult::Nodes(nodes) => println!("Nodes found: {:?}", nodes),
     /// }
     /// ```
-    pub fn find_value(&self, key: &[u8]) -> FindValueResult {
+    pub fn find_value_og(&self, key: &[u8]) -> FindValueResult {
         let hash = Self::hash_key(key);
         if let Some(value) = self.storage.get(&hash) {
             FindValueResult::Value(value.clone())
@@ -331,6 +331,27 @@ impl KademliaNode {
 
             FindValueResult::Nodes(self.find_node(&NodeId::from_slice(&hash_array)))
         }
+    }
+
+    pub async fn find_value(&self, key: &[u8]) -> FindValueResult {
+        let hash = Self::hash_key(key);
+        
+        // Check cache first
+        if let Ok(value) = self.cache.get(&hash).await {
+            return FindValueResult::Value(value);
+        }
+        
+        // Then check local storage
+        if let Some(value) = self.storage.get(&hash) {
+            // Store in cache for future use
+            if let Err(e) = self.cache.put(hash.clone(), value.clone(), Duration::from_secs(3600)).await {
+                warn!("Failed to store in cache: {:?}", e);
+            }
+            return FindValueResult::Value(value.clone());
+        }
+    
+        // If not found locally, return closest nodes
+        FindValueResult::Nodes(self.find_node(&NodeId::from_slice(hash[..].try_into().expect("Hash length is not 32 bytes"))))
     }
 
     /// Pings a remote node to check its availability.
