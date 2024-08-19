@@ -47,6 +47,12 @@ impl NodeId {
         NodeId(result)
     }
 
+    // Compare NodeIds based on their distances for sorting purposes    
+    pub fn compare_distance(&self, other: &NodeId) -> Ordering {
+        self.0.iter().cmp(other.0.iter())
+    }
+
+
     /// Creates a `NodeId` from a 32-byte slice.
     ///
     /// # Arguments

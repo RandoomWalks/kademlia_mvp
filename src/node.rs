@@ -18,11 +18,99 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
 
+use std::collections::{BinaryHeap, HashSet};
+use std::collections::{VecDeque};
+use std::cmp::Ordering;
+use tokio::sync::Mutex;
+
+
 use std::fmt;
 
 use crate::utils::{ALPHA, BOOTSTRAP_NODES, K};
 use bincode::{deserialize, serialize};
 
+
+
+// Add this new struct to manage lookup state
+
+struct NodeInfo {
+    id: NodeId,
+    addr: SocketAddr,
+    distance: NodeId,
+}
+
+impl PartialEq for NodeInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for NodeInfo {}
+
+impl PartialOrd for NodeInfo {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.distance.compare_distance(&other.distance))
+    }
+}
+
+impl Ord for NodeInfo {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.distance.compare_distance(&other.distance)
+    }
+}
+
+struct LookupState {
+    target: NodeId,
+    closest_nodes: Vec<NodeInfo>,
+    queried_nodes: HashSet<NodeId>,
+    pending_queries: HashSet<NodeId>,
+}
+
+impl LookupState {
+    fn new(target: NodeId, initial_nodes: Vec<(NodeId, SocketAddr)>) -> Self {
+        let mut closest_nodes = Vec::new();
+        for (id, addr) in initial_nodes {
+            let distance = target.distance(&id);
+            closest_nodes.push(NodeInfo { id, addr, distance });
+        }
+        closest_nodes.sort_unstable();
+
+        LookupState {
+            target,
+            closest_nodes,
+            queried_nodes: HashSet::new(),
+            pending_queries: HashSet::new(),
+        }
+    }
+
+    fn update_with_new_nodes(&mut self, new_nodes: Vec<(NodeId, SocketAddr)>) {
+        for (id, addr) in new_nodes {
+            if !self.queried_nodes.contains(&id) && !self.pending_queries.contains(&id) {
+                let distance = self.target.distance(&id);
+                self.closest_nodes.push(NodeInfo { id, addr, distance });
+            }
+        }
+
+        self.closest_nodes.sort_unstable();
+        self.closest_nodes.truncate(K);
+    }
+
+    fn select_next_nodes(&mut self, alpha: usize) -> Vec<(NodeId, SocketAddr)> {
+        let mut selected = Vec::new();
+
+        for node_info in self.closest_nodes.iter() {
+            if selected.len() >= alpha {
+                break;
+            }
+            if !self.queried_nodes.contains(&node_info.id) && !self.pending_queries.contains(&node_info.id) {
+                selected.push((node_info.id.clone(), node_info.addr));
+                self.pending_queries.insert(node_info.id.clone());
+            }
+        }
+
+        selected
+    }
+}
 /// Represents a Kademlia node in a distributed hash table (DHT).
 /// Each node stores its ID, address, routing table, and a storage map for key-value pairs.
 pub struct KademliaNode {
@@ -257,7 +345,7 @@ impl KademliaNode {
             // - Searches for the closest nodes to the target NodeId in the routing table.
             // - Sends the found nodes back to the requester as a NodesFound message.
             Message::FindNode { target } => {
-                let nodes = self.find_node(&target);
+                let nodes = self.find_node(&target).await;
                 self.send_message(&Message::NodesFound(nodes), src).await?;
                 info!(
                     "Received FindNode from {:#?}, responded with NodesFound",
@@ -350,6 +438,69 @@ impl KademliaNode {
         Sha256::digest(key).to_vec()
     }
 
+
+    pub async fn iterative_find_node(&self, target: &NodeId) -> Vec<(NodeId, SocketAddr)> {
+        let initial_nodes = self.routing_table.find_closest(target, ALPHA);
+        let state = Mutex::new(LookupState::new(target.clone(), initial_nodes));
+        let mut round = 0;
+
+        loop {
+            let nodes_to_query = {
+                let mut state_guard = state.lock().await;
+                state_guard.select_next_nodes(ALPHA)
+            };
+
+            if nodes_to_query.is_empty() {
+                break;
+            }
+
+            let mut query_futures = Vec::new();
+            for (node_id, addr) in nodes_to_query.iter() {
+                let future = self.find_node_rpc(node_id.clone(), addr.clone(), target.clone());
+                query_futures.push(future);
+            }
+
+            let results = futures::future::join_all(query_futures).await;
+
+            let mut new_nodes = Vec::new();
+            for (result, (node_id, addr)) in results.into_iter().zip(nodes_to_query.iter()) {
+                match result {
+                    Ok(nodes) => new_nodes.extend(nodes),
+                    Err(e) => warn!("Failed to query node {:?}: {:?}", node_id, e),
+                }
+
+                let mut state_guard = state.lock().await;
+                state_guard.queried_nodes.insert(node_id.clone());
+                state_guard.pending_queries.remove(node_id);
+            }
+
+            {
+                let mut state_guard = state.lock().await;
+                state_guard.update_with_new_nodes(new_nodes);
+            }
+
+            round += 1;
+            if round >= 3 { // You might want to adjust this termination condition
+                break;
+            }
+        }
+
+        let state_guard = state.lock().await;
+        state_guard.closest_nodes.iter()
+            .take(K)
+            .map(|node_info| (node_info.id.clone(), node_info.addr))
+            .collect()
+    }
+
+    async fn find_node_rpc(&self, node_id: NodeId, addr: SocketAddr, target: NodeId) -> Result<Vec<(NodeId, SocketAddr)>, std::io::Error> {
+        let message = Message::FindNode { target };
+        self.send_message(&message, addr).await?;
+
+        // In a real implementation, you'd wait for and process the response here
+        // For now, we'll just return an empty vector
+        Ok(Vec::new())
+    }
+
     /// Finds the closest nodes to a given target node ID within the routing table.
     ///
     /// **Input:**
@@ -361,37 +512,12 @@ impl KademliaNode {
     /// Example:
     /// ```rust
     /// let target_node = NodeId::new();
-    /// let closest_nodes = node.find_node(&target_node);
+    /// let closest_nodes = node.find_node(&target_node).await;
     /// ```
-    pub fn find_node(&self, target: &NodeId) -> Vec<(NodeId, SocketAddr)> {
-        self.routing_table.find_closest(target, K)
-    }
+    pub async fn find_node(&self, target: &NodeId) -> Vec<(NodeId, SocketAddr)> {
+        // self.routing_table.find_closest(target, K)
+        self.iterative_find_node(target).await
 
-    /// Finds a value in the local storage or returns the closest nodes if the value is not found.
-    ///
-    /// **Input:**
-    /// - `key`: The key as a byte slice to search for.
-    ///
-    /// **Output:**
-    /// - Returns a `FindValueResult`, which can be either the value found or a list of closest nodes.
-    ///
-    /// Example:
-    /// ```rust
-    /// let key = b"example_key";
-    /// match node.find_value(&key) {
-    ///     FindValueResult::Value(val) => println!("Value found: {:?}", val),
-    ///     FindValueResult::Nodes(nodes) => println!("Nodes found: {:?}", nodes),
-    /// }
-    /// ```
-    pub fn find_value_og(&self, key: &[u8]) -> FindValueResult {
-        let hash = Self::hash_key(key);
-        if let Some(value) = self.storage.get(&hash) {
-            FindValueResult::Value(value.clone())
-        } else {
-            let hash_array: [u8; 32] = hash[..].try_into().expect("Hash length is not 32 bytes"); // Converts the `hash` (which is a `Vec<u8>` of SHA-256 hash bytes) into a fixed-size array of 32 bytes.
-
-            FindValueResult::Nodes(self.find_node(&NodeId::from_slice(&hash_array)))
-        }
     }
 
     pub async fn find_value(&self, key: &[u8]) -> FindValueResult {
@@ -412,7 +538,7 @@ impl KademliaNode {
         }
     
         // If not found locally, return closest nodes
-        FindValueResult::Nodes(self.find_node(&NodeId::from_slice(hash[..].try_into().expect("Hash length is not 32 bytes"))))
+        FindValueResult::Nodes(self.find_node(&NodeId::from_slice(hash[..].try_into().expect("Hash length is not 32 bytes"))).await )
     }
 
     /// Pings a remote node to check its availability.
@@ -455,7 +581,7 @@ impl KademliaNode {
 
         let target = NodeId::from_slice(&hash_array);
 
-        let nodes = self.find_node(&target);
+        let nodes = self.find_node(&target).await;
 
         for (_, addr) in nodes.iter().take(ALPHA) {
             if let Err(e) = self
@@ -525,7 +651,7 @@ impl KademliaNode {
 
         let target = NodeId::from_slice(res);
 
-        let nodes = self.find_node(&target);
+        let nodes = self.find_node(&target).await;
 
         for (_, addr) in nodes.iter().take(ALPHA) {
             if let Err(e) = self
@@ -582,3 +708,4 @@ impl KademliaNode {
         Ok(())
     }
 }
+
