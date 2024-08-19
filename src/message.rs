@@ -1,18 +1,30 @@
 use crate::utils::NodeId;
 use std::net::SocketAddr;
 use serde::{Serialize, Deserialize};
+use std::time::SystemTime;
 
 /// Enum representing different types of messages exchanged in the network.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Message {
     Ping { sender: NodeId },                          // Ping message to check if a node is alive
     Pong { sender: NodeId },                          // Pong response to a ping
-    Store { key: Vec<u8>, value: Vec<u8> },           // Store a key-value pair on a node
+    // Store { key: Vec<u8>, value: Vec<u8> },           // Store a key-value pair on a node
     FindNode { target: NodeId },                      // Request to find nodes closest to the target `NodeId`
     FindValue { key: Vec<u8> },                       // Request to find the value associated with a key
     NodesFound(Vec<(NodeId, SocketAddr)>),            // Response containing a list of nodes closest to the target
     ValueFound(Vec<u8>),                              // Response containing the value associated with the key
     Stored,                                           // Acknowledgment that a key-value pair has been stored
+    Store {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        sender: NodeId,
+        timestamp: SystemTime,
+    },
+    StoreResponse {
+        success: bool,
+        error_message: Option<String>,
+    },
+    
 }
 
 

@@ -22,7 +22,7 @@ use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::collections::{BinaryHeap, HashSet};
 use tokio::sync::Mutex;
-
+use std::time::SystemTime;
 use std::future::Future;
 
 
@@ -183,13 +183,12 @@ impl KademliaNode {
     }
 
     async fn start_cache_maintenance(&self) {
-        let mut interval = tokio::time::interval(Duration::from_secs(3600)); // Run every hour
+        let mut interval = tokio::time::interval(self.cache_config.maintenance_interval);
         loop {
             interval.tick().await;
             debug!("Performing cache maintenance");
-            // if let Err(e) = self.cache.evict().await {
-            //     warn!("Error during cache eviction: {:?}", e);
-            // }
+            let evicted_count = self.cache.evict().await;
+            info!("Evicted {:#?} items from cache", evicted_count);
         }
     }
 
@@ -275,6 +274,18 @@ impl KademliaNode {
         Ok(())
     }
 
+    fn validate_key_value(&self, key: &[u8], value: &[u8]) -> Result<(), &'static str> {
+        const MAX_KEY_SIZE: usize = 32;
+        const MAX_VALUE_SIZE: usize = 1024;
+
+        if key.len() > MAX_KEY_SIZE {
+            return Err("Key size exceeds maximum allowed");
+        }
+        if value.len() > MAX_VALUE_SIZE {
+            return Err("Value size exceeds maximum allowed");
+        }
+        Ok(())
+    }
     /// Handles incoming Kademlia protocol messages and responds accordingly.
     ///
     /// **Input:**
@@ -307,47 +318,22 @@ impl KademliaNode {
 
                 info!("Received Pong from {:#?}", src);
             }
-            Message::Store { key, value } => {
-                // TODO: Find k closest nodes to myself (as opposed to the key of the storvalue)
-                let hash = Self::hash_key(&key);
-                // let target = NodeId::from_slice(&hash);
-
-                // let sli_mut = hash.as_ref();
-                let sli_mut: &[u8] = hash.as_slice();
-                let fixed_sli: [u8; 32] = sli_mut.try_into().unwrap();
-                // let sli:[u8;32] = hash.iter().map(|&i| i as u8).try_into().unwrap();
-
-                // let hash_array: NodeId = hash[..].try_into().expect("Hash length is not 32 bytes"); // Converts the `hash` (which is a `Vec<u8>` of SHA-256 hash bytes) into a fixed-size array of 32 bytes.
-
-                // let fixed_len_sli:NodeId = sli_mut.try_into();
-
-                let k = 3;
-                let n = NodeId(fixed_sli);
-
-                let closest_nodes = self.routing_table.find_closest(&n, k);
-
-                // Storing locally if we're one of the k closest
-                for (node_id, addr) in closest_nodes {
-                    // check not self
-                    if node_id != self.id {
-                        // send rpc
-                        self.send_message(
-                            &Message::Store {
-                                key: key.clone(),
-                                value: value.clone(),
-                            },
-                            addr,
-                        )
-                        .await?;
+            Message::Store { key, value, sender, timestamp } => {
+                match self.validate_key_value(&key, &value) {
+                    Ok(()) => {
+                        self.store(&key, &value).await;
+                        // Update cache
+                        if let Err(e) = self.cache.put(key.clone(), value.clone(), self.cache_config.ttl).await {
+                            warn!("Failed to update cache: {:?}", e);
+                        }
+                        self.send_store_response(true, None, src).await?;
+                    },
+                    Err(e) => {
+                        warn!("Invalid STORE request from {:?}: {}", src, e);
+                        self.send_store_response(false, Some(e), src).await?;
                     }
                 }
-                self.send_message(&Message::Stored, src).await?;
-
-                // TODO: Send STORE RPCs to each of these k nodes.
-
-                // self.store(&key, &value).await;
-                // self.send_message(&Message::Stored, src).await?;
-                info!("Stored value for key {:?} from {:#?}", key, src);
+                self.routing_table.update(sender, src);
             }
             // Handles a FindNode request:
             // - Searches for the closest nodes to the target NodeId in the routing table.
@@ -416,19 +402,55 @@ impl KademliaNode {
     /// ```
     pub async fn store(&mut self, key: &[u8], value: &[u8]) {
         let hash = Self::hash_key(key);
-        self.storage.insert(hash.to_vec(), value.to_vec());
-
-        // self.cache
-        //     .put(hash.to_vec(), value.to_vec(), Duration::from_secs(3600));
-        // Add this block to store in cache
-        if let Err(e) = self
-            .cache
-            .put(hash.to_vec(), value.to_vec(), Duration::from_secs(3600))
-            .await
-        {
-            error!("Failed to store in cache: {:?}", e);
+        match self.storage.entry(hash.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get() != value {
+                    warn!("Key collision detected. Overwriting existing value.");
+                    entry.insert(value.to_vec());
+                }
+            },
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(value.to_vec());
+            },
         }
-        info!("Stored value for key: {:?}", hash);
+
+        info!("Storing value for key: {:?}", hash);
+        // Update cache
+        if let Err(e) = self.cache.put(hash, value.to_vec(), self.cache_config.ttl).await {
+            warn!("Failed to update cache: {:?}", e);
+        }
+        // info!("Storing value for key: {:?}", hash);
+    }
+
+    async fn send_store_message(&self, key: &[u8], value: &[u8], addr: SocketAddr) -> Result<bool, std::io::Error> {
+        let message = Message::Store {
+            key: key.to_vec(),
+            value: value.to_vec(),
+            sender: self.id,
+            timestamp: SystemTime::now(),
+        };
+        self.send_message(&message, addr).await?;
+
+        // Wait for response with timeout
+        match tokio::time::timeout(Duration::from_secs(5), self.receive_message()).await {
+            Ok(Ok(Message::StoreResponse { success, error_message })) => {
+                if !success {
+                    warn!("Store failed on node {:?}: {:?}", addr, error_message);
+                }
+                Ok(success)
+            },
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Store response timed out")),
+            _ => Err(std::io::Error::new(std::io::ErrorKind::Other, "Unexpected response")),
+        }
+    }
+    
+    async fn send_store_response(&self, success: bool, error_message: Option<&str>, dst: SocketAddr) -> std::io::Result<()> {
+        let response = Message::StoreResponse {
+            success,
+            error_message: error_message.map(String::from),
+        };
+        self.send_message(&response, dst).await
     }
 
     /// Hashes a key using the SHA-256 algorithm and returns the hash as a byte vector.
@@ -573,14 +595,13 @@ impl KademliaNode {
         }
     }
 
-    async fn receive_message(socket: &Arc<UdpSocket>) -> std::io::Result<Message> {
+    async fn receive_message(&self) -> std::io::Result<Message> {
         let mut buf = vec![0u8; 1024];
-        let (size, _) = socket.recv_from(&mut buf).await?;
+        let (size, _) = self.socket.recv_from(&mut buf).await?;
         let message: Message = bincode::deserialize(&buf[..size])
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         Ok(message)
     }
-
 
     /// Finds the closest nodes to a given target node ID within the routing table.
     ///
@@ -673,31 +694,33 @@ impl KademliaNode {
     /// ```rust
     /// node.put(b"example_key", b"example_value").await.unwrap();
     /// ```
-    pub async fn put(&mut self, key: &[u8], value: &[u8]) -> std::io::Result<()> {
-        let hash = Self::hash_key(key);
-        let hash_array: [u8; 32] = hash[..].try_into().expect("Hash length is not 32 bytes"); // Converts the `hash` (which is a `Vec<u8>` of SHA-256 hash bytes) into a fixed-size array of 32 bytes.  If `hash` is not exactly 32 bytes, the `expect` call will panic
+    pub async fn put(&mut self, key: &[u8], value: &[u8] ) -> Result<(), std::io::Error> {
+        let hash: Vec<u8> = Self::hash_key(key);
 
-        let target = NodeId::from_slice(&hash_array);
+        let target = NodeId::from_slice(&hash[..].try_into().expect("Hash is not 32 bytes long") );
 
-        let nodes = self.find_node(target).await?;
+        // Store locally
+        self.store(key, value).await;
 
-        for (_, addr) in nodes.iter().take(ALPHA) {
-            if let Err(e) = self
-                .send_message(
-                    &Message::Store {
-                        key: key.to_vec(),
-                        value: value.to_vec(),
-                    },
-                    *addr,
-                )
-                .await
-            {
-                error!("Failed to send Store message to {:#?}: {:?}", addr, e);
+        // Find k closest nodes
+        let closest_nodes = self.find_node(target).await?;
+
+        let mut success_count = 0;
+        for (node_id, addr) in closest_nodes.iter().take(ALPHA) {
+            if *node_id != self.id {
+                match self.send_store_message(key, value, *addr).await {
+                    Ok(true) => success_count += 1,
+                    Ok(false) => warn!("Store operation failed on node {:?}", node_id),
+                    Err(e) => warn!("Error sending STORE to node {:?}: {:?}", node_id, e),
+                }
             }
         }
 
-        self.store(key, value);
-        Ok(())
+        if success_count == 0 {
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to store on any node"))
+        } else {
+            Ok(())
+        }
     }
 
     /// Retrieves a value associated with a key from local storage or requests it from nearby nodes.
