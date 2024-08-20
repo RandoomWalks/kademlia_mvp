@@ -397,21 +397,63 @@ impl KademliaNode {
     }
 
     async fn find_value(&self, key: &[u8]) -> FindValueResult {
+        // First, check local storage
         if let Some(value) = self.storage_manager.get(key).await {
-            FindValueResult::Value(value)
-        } else {
-            match self
-                .find_node(NodeId::from_slice(
-                    &StorageManager::hash_key(key)[..32].try_into().unwrap(),
-                ))
-                .await
-            {
-                Ok(nodes) => FindValueResult::Nodes(nodes),
-                Err(e) => {
-                    warn!("Failed to find nodes: {:?}", e);
-                    FindValueResult::Nodes(vec![])
+            return FindValueResult::Value(value);
+        }
+
+        // If not found locally, perform a network lookup
+        let target = NodeId::from_slice(&StorageManager::hash_key(key)[..32].try_into().unwrap());
+        let mut closest_nodes = self.routing_table.find_closest(&target, self.config.k);
+        let mut queried_nodes = HashSet::new();
+
+        while !closest_nodes.is_empty() {
+            let mut new_queries = Vec::new();
+
+            for (node_id, addr) in closest_nodes.iter().take(self.config.alpha) {
+                if queried_nodes.contains(node_id) {
+                    continue;
                 }
+
+                match self.send_find_value_message(key, *addr).await {
+                    Ok(Message::ValueFound(value)) => return FindValueResult::Value(value),
+                    Ok(Message::NodesFound(nodes)) => {
+                        new_queries.extend(nodes);
+                    }
+                    _ => {} // Handle other cases or errors
+                }
+
+                queried_nodes.insert(*node_id);
             }
+
+            // Update closest nodes
+            closest_nodes.extend(new_queries);
+            closest_nodes.sort_by(|a, b| target.distance(&a.0).cmp(&target.distance(&b.0)));
+            closest_nodes.truncate(self.config.k);
+
+            // Break if we've queried enough nodes
+            if queried_nodes.len() >= self.config.k {
+                break;
+            }
+        }
+
+        // If value not found, return the closest nodes
+        FindValueResult::Nodes(closest_nodes)
+    }
+
+    async fn send_find_value_message(&self, key: &[u8], addr: SocketAddr) -> Result<Message, KademliaError> {
+        let message = Message::FindValue { key: key.to_vec() };
+        self.network_manager.send_message(&message, addr).await?;
+
+        match tokio::time::timeout(
+            self.config.request_timeout,
+            self.network_manager.receive_message(),
+        )
+        .await
+        {
+            Ok(Ok((response, _))) => Ok(response),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(KademliaError::Timeout),
         }
     }
 
