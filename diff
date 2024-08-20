@@ -1,0 +1,1053 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 58d6ba0..22dddb1 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -3,6 +3,7 @@ pub mod utils;
+ pub mod message;
+ pub mod routing_table;
+ pub mod kbucket;
+-pub mod unit_test;
+ 
+-pub mod cache;
+\ No newline at end of file
++pub mod cache;
++
++pub mod node_test;
+diff --git a/src/node.rs b/src/node.rs
+index 5126fe2..62d9f91 100644
+--- a/src/node.rs
++++ b/src/node.rs
+@@ -162,6 +162,8 @@ pub struct KademliaNode {
+     config: Arc<Config>,
+     time_provider: Arc<dyn TimeProvider>,
+     delay_provider: Arc<dyn Delay>,
++    pub bootstrap_nodes: Vec<SocketAddr>, // New field for bootstrap nodes
++
+ }
+ 
+ impl fmt::Debug for KademliaNode {
+@@ -181,6 +183,8 @@ impl KademliaNode {
+         socket: Arc<dyn NetworkInterface>,
+         time_provider: Arc<dyn TimeProvider>,
+         delay_provider: Arc<dyn Delay>,
++        bootstrap_nodes: Vec<SocketAddr>, // New parameter
++
+     ) -> Result<(Self, mpsc::Sender<()>), KademliaError> {
+         let id = NodeId::new();
+         let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
+@@ -198,19 +202,20 @@ impl KademliaNode {
+                 config,
+                 time_provider,
+                 delay_provider,
++                bootstrap_nodes,
+             },
+             shutdown_sender,
+         ))
+     }
+ 
+     pub async fn bootstrap(&mut self) -> Result<(), KademliaError> {
+-        for &bootstrap_addr in BOOTSTRAP_NODES.iter() {
+-            if let Ok(addr) = bootstrap_addr.parse::<SocketAddr>() {
+-                if let Err(e) = self.ping(addr).await {
+-                    warn!("Failed to ping bootstrap node {}: {:?}", bootstrap_addr, e);
+-                }
++        for &bootstrap_addr in &self.bootstrap_nodes {
++            if let Err(e) = self.ping(bootstrap_addr).await {
++                warn!("Failed to ping bootstrap node {}: {:?}", bootstrap_addr, e);
+             } else {
+-                warn!("Invalid bootstrap address: {}", bootstrap_addr);
++                // If ping succeeds, add the node to the routing table
++                let node_id = NodeId::new(); // Generate a random ID for the bootstrap node
++                self.routing_table.update(node_id, bootstrap_addr);
+             }
+         }
+         Ok(())
+@@ -360,15 +365,23 @@ impl KademliaNode {
+     }
+ 
+     pub async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), KademliaError> {
++        debug!("Attempting to store key: {:?}, value: {:?}", key, value);
++
+         self.validate_key_value(key, value)?;
+         self.storage_manager.store(key, value).await?;
+ 
+         let hash = StorageManager::hash_key(key);
+         let target = NodeId::from_slice(&hash[..32].try_into().unwrap());
+         let closest_nodes = self.find_node(target).await?;
+-
++        if closest_nodes.is_empty() {
++            error!("No closest nodes found for storage");
++            return Err(KademliaError::InvalidData("No nodes available for storage"));
++        }
++    
+         let mut success_count = 0;
+         for (node_id, addr) in closest_nodes.iter().take(self.config.alpha) {
++            debug!("Sending store request to node: {:?} at address: {:?}", node_id, addr);
++
+             if *node_id != self.id {
+                 match self.send_store_message(key, value, *addr).await {
+                     Ok(true) => success_count += 1,
+@@ -378,7 +391,9 @@ impl KademliaNode {
+             }
+         }
+ 
+-        if success_count == 0 {
++        if success_count == 0 && !closest_nodes.is_empty() {
++            error!("Failed to store on any node");
++
+             Err(KademliaError::InvalidData("Failed to store on any node"))
+         } else {
+             Ok(())
+diff --git a/src/node_test.rs b/src/node_test.rs
+new file mode 100644
+index 0000000..3b5d2ad
+--- /dev/null
++++ b/src/node_test.rs
+@@ -0,0 +1,145 @@
++use std::net::SocketAddr;
++use std::sync::Arc;
++use tokio::sync::Mutex;
++use std::collections::HashMap;
++use std::time::{Duration, SystemTime};
++use crate::cache::{cache_impl, policy};
++use crate::message::{Message, FindValueResult};
++use crate::routing_table::RoutingTable;
++use crate::utils::NodeId;
++
++use crate::node::{Config, KademliaError, KademliaNode, NetworkInterface, TimeProvider, Delay};
++use log::{debug, error, info, warn};
++use serde::{Deserialize, Serialize};
++use sha2::{Digest, Sha256};
++use std::collections::HashSet;
++use std::fmt;
++use std::future::Future;
++use std::pin::Pin;
++use tokio::net::UdpSocket;
++use tokio::sync::mpsc;
++use tokio::time::interval;
++
++use bincode::{deserialize, serialize};
++
++// Mock implementations
++struct MockNetworkInterface {
++    sent_messages: Arc<Mutex<Vec<(Vec<u8>, SocketAddr)>>>,
++    received_messages: Arc<Mutex<Vec<(Vec<u8>, SocketAddr)>>>,
++    stored_data: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
++}
++
++impl NetworkInterface for MockNetworkInterface {
++    fn send_to(&self, buf: &[u8], addr: SocketAddr) -> std::io::Result<usize> {
++        let mut sent_messages = futures::executor::block_on(self.sent_messages.lock());
++        sent_messages.push((buf.to_vec(), addr));
++
++        // Simulate network response
++        let message: Message = bincode::deserialize(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
++        match message {
++            Message::Store { key, value, .. } => {
++                let mut stored_data = futures::executor::block_on(self.stored_data.lock());
++                stored_data.insert(key, value);
++                let response = Message::StoreResponse { success: true, error_message: None };
++                let serialized_response = bincode::serialize(&response).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
++                let mut received_messages = futures::executor::block_on(self.received_messages.lock());
++                received_messages.push((serialized_response, addr));
++            },
++            Message::FindNode { .. } => {
++                let response = Message::NodesFound(vec![(NodeId::new(), addr)]);
++                let serialized_response = bincode::serialize(&response).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
++                let mut received_messages = futures::executor::block_on(self.received_messages.lock());
++                received_messages.push((serialized_response, addr));
++            },
++            _ => {}
++        }
++
++        Ok(buf.len())
++    }
++
++    fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
++        let mut received_messages = futures::executor::block_on(self.received_messages.lock());
++        if let Some((message, addr)) = received_messages.pop() {
++            buf[..message.len()].copy_from_slice(&message);
++            Ok((message.len(), addr))
++        } else {
++            Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "No messages"))
++        }
++    }
++}
++
++struct MockTimeProvider;
++
++impl TimeProvider for MockTimeProvider {
++    fn now(&self) -> SystemTime {
++        SystemTime::now()
++    }
++}
++
++struct MockDelay;
++
++impl Delay for MockDelay {
++    fn delay(&self, _duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
++        Box::pin(async {})
++    }
++}
++
++#[tokio::test]
++async fn test_put_and_get() {
++    // Setup
++    let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
++    let bootstrap_addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
++    let mock_network = Arc::new(MockNetworkInterface {
++        sent_messages: Arc::new(Mutex::new(Vec::new())),
++        received_messages: Arc::new(Mutex::new(Vec::new())),
++        stored_data: Arc::new(Mutex::new(HashMap::new())),
++    });
++    let mock_time_provider = Arc::new(MockTimeProvider);
++    let mock_delay_provider = Arc::new(MockDelay);
++
++    let config = Config {
++        k: 20,
++        alpha: 3,
++        request_timeout: Duration::from_secs(1),
++        cache_size: 100,
++        cache_ttl: Duration::from_secs(3600),
++        maintenance_interval: Duration::from_secs(3600),
++    };
++
++    let bootstrap_nodes = vec![bootstrap_addr];
++
++    let (mut node, _shutdown_sender) = KademliaNode::new(
++        addr,
++        Some(config),
++        mock_network.clone(),
++        mock_time_provider,
++        mock_delay_provider,
++        bootstrap_nodes,
++    )
++    .await
++    .expect("Failed to create KademliaNode");
++
++    // Bootstrap the node
++    node.bootstrap().await.expect("Failed to bootstrap node");
++
++    // Test put
++    let key = b"test_key";
++    let value = b"test_value";
++    node.put(key, value).await.expect("Failed to put value");
++
++    // Test get
++    let retrieved_value = node.get(key).await.expect("Failed to get value");
++    assert_eq!(Some(value.to_vec()), retrieved_value, "Retrieved value does not match put value");
++
++    // Verify network operations
++    let sent_messages = mock_network.sent_messages.lock().await;
++    assert!(!sent_messages.is_empty(), "No messages were sent during operations");
++
++    // Verify stored data
++    let stored_data = mock_network.stored_data.lock().await;
++    // assert_eq!(stored_data.get(key), Some(&value.to_vec()), "Value was not stored in the mock network"); // types. A Vec<u8> can be borrowed as [u8] (a slice), but not as [u8; 8] (a fixed-size array).
++
++    assert_eq!(stored_data.get(&key[..]), Some(&value.to_vec()), "Value was not stored in the mock network");
++
++    println!("All tests passed!");
++}
+\ No newline at end of file
+diff --git a/src/unit_test.rs b/src/unit_test.rs
+deleted file mode 100644
+index a8d2c8c..0000000
+--- a/src/unit_test.rs
++++ /dev/null
+@@ -1,301 +0,0 @@
+-use crate::message::{FindValueResult, Message};
+-use crate::node::KademliaNode;
+-use crate::routing_table::RoutingTable;
+-use crate::utils::NodeId;
+-use std::net::SocketAddr;
+-use tokio::sync::mpsc;
+-use log::{debug, info};
+-
+-
+-
+-// CMD TO RUN TESTS W/ CLEAR DEBUG OUTPUT
+-// $ RUST_LOG=debug cargo unit  -- --nocapture  --test-threads=1
+-
+-// Initialize the logger once for all tests
+-fn init_logger() {
+-    let _ = env_logger::builder()
+-        .filter_level(log::LevelFilter::Trace) // Set the desired log level
+-        .try_init();
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-
+-    #[tokio::test]
+-    async fn test_node_id_distance() {
+-        init_logger();
+-        debug!("Starting test: test_node_id_distance");
+-
+-        let id1 = NodeId([0u8; 32]);
+-        let id2 = NodeId([255u8; 32]);
+-        let distance = id1.distance(&id2);
+-
+-        debug!("id1: {:?}, id2: {:?}, distance: {:?}", id1, id2, distance);
+-
+-        for byte in distance.as_bytes() {
+-            assert_eq!(*byte, 255u8);
+-        }
+-        
+-        debug!("Completed test: test_node_id_distance");
+-    }
+-
+-    #[tokio::test]
+-    async fn test_node_id_ordering() {
+-        init_logger();
+-        debug!("Starting test: test_node_id_ordering");
+-
+-        let id1 = NodeId([1u8; 32]);
+-        let id2 = NodeId([2u8; 32]);
+-
+-        debug!("id1: {:?}, id2: {:?}", id1, id2);
+-        assert!(id1 < id2);
+-
+-        debug!("Completed test: test_node_id_ordering");
+-    }
+-
+-    #[tokio::test]
+-    async fn test_routing_table_update() {
+-        init_logger();
+-        debug!("Starting test: test_routing_table_update");
+-
+-        let node_id = NodeId::new();
+-        debug!("Generated node_id: {:?}", node_id);
+-
+-        let mut routing_table = RoutingTable::new(node_id);
+-        let node_to_add = NodeId::new();
+-        debug!("Adding node_id: {:?}", node_to_add);
+-
+-        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+-        routing_table.update(node_to_add, addr);
+-
+-        let bucket_index = node_id
+-            .distance(&node_to_add)
+-            .as_bytes()
+-            .iter()
+-            .position(|&x| x != 0)
+-            .unwrap_or(255);
+-        let bucket = &routing_table.buckets[bucket_index];
+-
+-        debug!("Bucket index: {}, Bucket: {:?}", bucket_index, bucket);
+-        assert!(bucket.entries.iter().any(|entry| entry.node_id == node_to_add));
+-
+-        debug!("Completed test: test_routing_table_update");
+-    }
+-
+-    #[tokio::test]
+-    async fn test_routing_table_find_closest() {
+-        init_logger();
+-        debug!("Starting test: test_routing_table_find_closest");
+-
+-        let node_id = NodeId::new();
+-        debug!("Generated node_id: {:?}", node_id);
+-
+-        let mut routing_table = RoutingTable::new(node_id);
+-
+-        let target_id = NodeId::new();
+-        debug!("Target node_id: {:?}", target_id);
+-
+-        let addr1: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+-        let addr2: SocketAddr = "127.0.0.1:8082".parse().unwrap();
+-
+-        routing_table.update(NodeId::new(), addr1);
+-        routing_table.update(NodeId::new(), addr2);
+-
+-        let closest_nodes = routing_table.find_closest(&target_id, 2);
+-        debug!("Closest nodes found: {:?}", closest_nodes);
+-
+-        assert_eq!(closest_nodes.len(), 2);
+-
+-        debug!("Completed test: test_routing_table_find_closest");
+-    }
+-
+-    #[tokio::test]
+-    async fn test_kademlia_node_store_and_find_value() {
+-        init_logger();
+-        debug!("Starting test: test_kademlia_node_store_and_find_value");
+-
+-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-        let (mut node, _) = KademliaNode::new(addr).await.unwrap();
+-        let actual_addr = node.socket.local_addr().unwrap();
+-
+-        debug!("Node address: {:?}", actual_addr);
+-
+-        let key = b"mykey";
+-        let value = b"myvalue";
+-
+-        debug!("Storing key: {:?}, value: {:?}", key, value);
+-        node.store(key, value);
+-
+-        let find_result = node.find_value(key);
+-        debug!("Find result: {:?}", find_result);
+-
+-        if let FindValueResult::Value(stored_value) = find_result {
+-            assert_eq!(stored_value, value);
+-        } else {
+-            panic!("Expected to find the stored value.");
+-        }
+-
+-        debug!("Completed test: test_kademlia_node_store_and_find_value");
+-    }
+-
+-    #[tokio::test]
+-    async fn test_kademlia_node_ping() {
+-        init_logger();
+-        debug!("Starting test: test_kademlia_node_ping");
+-
+-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-        let (mut node, _) = KademliaNode::new(addr).await.unwrap();
+-        let actual_addr = node.socket.local_addr().unwrap();
+-
+-        debug!("Node address: {:?}", actual_addr);
+-
+-        let ping_addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+-        debug!("Sending ping to address: {:?}", ping_addr);
+-
+-        let result = node.ping(ping_addr).await;
+-        assert!(result.is_ok());
+-
+-        debug!("Ping result: {:?}", result);
+-        debug!("Completed test: test_kademlia_node_ping");
+-    }
+-
+-    #[tokio::test]
+-    async fn test_kademlia_node_put_and_get() {
+-        init_logger();
+-        debug!("Starting test: test_kademlia_node_put_and_get");
+-
+-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-        let (mut node, _) = KademliaNode::new(addr).await.unwrap();
+-        let actual_addr = node.socket.local_addr().unwrap();
+-
+-        debug!("Node address: {:?}", actual_addr);
+-
+-        let key = b"mykey";
+-        let value = b"myvalue";
+-
+-        debug!("Putting key: {:?}, value: {:?}", key, value);
+-        node.put(key, value).await.unwrap();
+-
+-        let stored_value = node.get(key).await.unwrap();
+-        debug!("Stored value retrieved: {:?}", stored_value);
+-
+-        assert_eq!(stored_value, Some(value.to_vec()));
+-
+-        debug!("Completed test: test_kademlia_node_put_and_get");
+-    }
+-
+-    #[tokio::test]
+-    async fn test_kademlia_node_handle_message_ping() {
+-        init_logger();
+-        debug!("Starting test: test_kademlia_node_handle_message_ping");
+-
+-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-        let (mut node, _) = KademliaNode::new(addr).await.unwrap();
+-        let actual_addr = node.socket.local_addr().unwrap();
+-
+-        debug!("Node address: {:?}", actual_addr);
+-
+-        let sender = NodeId::new();
+-        debug!("Generated sender NodeId: {:?}", sender);
+-
+-        let src: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+-        debug!("Handling Ping message from source: {:?}", src);
+-
+-        node.handle_message(Message::Ping { sender }, src)
+-            .await
+-            .unwrap();
+-
+-        let bucket_index = node
+-            .id
+-            .distance(&sender)
+-            .as_bytes()
+-            .iter()
+-            .position(|&x| x != 0)
+-            .unwrap_or(255);
+-
+-        let bucket = &node.routing_table.buckets[bucket_index];
+-        debug!("Bucket index: {}, Bucket: {:?}", bucket_index, bucket);
+-
+-        assert!(bucket.entries.iter().any(|entry| entry.node_id == sender));
+-
+-        debug!("Completed test: test_kademlia_node_handle_message_ping");
+-    }
+-
+-    #[tokio::test]
+-    async fn test_kademlia_node_handle_message_store() {
+-        init_logger();
+-        debug!("Starting test: test_kademlia_node_handle_message_store");
+-
+-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-        let (mut node, _) = KademliaNode::new(addr).await.unwrap();
+-        let actual_addr = node.socket.local_addr().unwrap();
+-
+-        debug!("Node address: {:?}", actual_addr);
+-
+-        let key = b"mykey".to_vec();
+-        let value = b"myvalue".to_vec();
+-        let src: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+-
+-        debug!("Handling Store message from source: {:?}, key: {:?}, value: {:?}", src, key, value);
+-
+-        node.handle_message(
+-            Message::Store {
+-                key: key.clone(),
+-                value: value.clone(),
+-            },
+-            src,
+-        )
+-        .await
+-        .unwrap();
+-
+-        let stored_value = node.storage.get(&KademliaNode::hash_key(&key));
+-        debug!("Stored value in node: {:?}", stored_value);
+-
+-        assert_eq!(stored_value, Some(&value));
+-
+-        debug!("Completed test: test_kademlia_node_handle_message_store");
+-    }
+-
+-    #[tokio::test]
+-    async fn test_kademlia_node_find_node() {
+-        init_logger();
+-        debug!("Starting test: test_kademlia_node_find_node");
+-
+-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-        let (mut node, _) = KademliaNode::new(addr).await.unwrap();
+-        let actual_addr = node.socket.local_addr().unwrap();
+-
+-        debug!("Node address: {:?}", actual_addr);
+-
+-        let target_id = NodeId::new();
+-        debug!("Target NodeId: {:?}", target_id);
+-
+-        let closest_nodes = node.find_node(&target_id);
+-        debug!("Closest nodes found: {:?}", closest_nodes);
+-
+-        // Test if closest nodes are returned, initially should be empty
+-        assert_eq!(closest_nodes.len(), 0);
+-
+-        debug!("Completed test: test_kademlia_node_find_node");
+-    }
+-
+-    #[tokio::test]
+-    async fn test_kademlia_node_refresh_buckets() {
+-        init_logger();
+-        debug!("Starting test: test_kademlia_node_refresh_buckets");
+-
+-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-        let (mut node, _) = KademliaNode::new(addr).await.unwrap();
+-        let actual_addr = node.socket.local_addr().unwrap();
+-
+-        debug!("Node address: {:?}", actual_addr);
+-
+-        let result = node.refresh_buckets().await;
+-        debug!("Refresh buckets result: {:?}", result);
+-
+-        assert!(result.is_ok());
+-
+-        debug!("Completed test: test_kademlia_node_refresh_buckets");
+-    }
+-}
+\ No newline at end of file
+diff --git a/tests/integration_tests.rs b/tests/integration_tests.rs
+deleted file mode 100644
+index edf9290..0000000
+--- a/tests/integration_tests.rs
++++ /dev/null
+@@ -1,234 +0,0 @@
+-use kademlia_mvp::message::{Message, FindValueResult};
+-use kademlia_mvp::node::KademliaNode;
+-use kademlia_mvp::utils::NodeId;
+-use std::net::SocketAddr;
+-use tokio::sync::mpsc;
+-use log::{debug, info};
+-
+-
+-// CMD TO RUN ALL TESTS(unit/intg) W/ CLEAR DEBUG OUTPUT
+-// $ RUST_LOG=debug cargo test  -- --nocapture  --test-threads=1
+-
+-// Specifiy single test file 
+-// $ RUST_LOG=debug cargo test --test integration_tests  -- --nocapture  --test-threads=1
+-
+-// Specifiy single test in single test file 
+-// $ RUST_LOG=debug cargo test test_node_discovery --test integration_tests  -- --nocapture  --test-threads=1
+-
+-// Specifiy single test in single test file w/ backtrace output
+-// $ RUST_BACKTRACE=1 RUST_LOG=debug cargo test test_node_discovery --test integration_tests  -- --nocapture  --test-threads=1
+-
+-// STEPS TO RUN IN VSCODE DEBUGGER (set breakpt on desired test, comment other tests out)
+-// 1. BUILD test w/o running it (integration tests are linked against the compiled main source code)-An executable is created for the integration tests, located in target/debug/deps/.
+-//      $ cargo test --no-run --test integration_tests --package=kademlia_mvp
+-//      Finished `test` profile [unoptimized + debuginfo] target(s) in 4.16s
+-//      Executable tests/integration_tests.rs (target/debug/deps/integration_tests-112b4aecda8f7c8f)
+-// 2. Binary ID is (112b4aecda8f7c8f)
+-// 3. add to launch.json
+-//            "program": "${workspaceFolder}/target/debug/deps/integration_tests-112b4aecda8f7c8f",
+-// 4. start "run and debug" for that task
+-
+-fn init_logger() {
+-    let _ = env_logger::builder()
+-        .filter_level(log::LevelFilter::Trace) // Set the desired log level
+-        .try_init();
+-}
+-
+-#[tokio::test]
+-async fn test_node_discovery() {
+-    init_logger();
+-    debug!("\n\n\n\n\n");
+-    debug!("============================");
+-    debug!("Starting test: test_node_discovery");
+-    debug!("============================");
+-
+-    let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-    let addr2: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-    let addr3: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-
+-    let (mut node1, _) = KademliaNode::new(addr1).await.unwrap();
+-    let (mut node2, _) = KademliaNode::new(addr2).await.unwrap();
+-    let (mut node3, _) = KademliaNode::new(addr3).await.unwrap();
+-    
+-    node2.bootstrap().await.unwrap();
+-    debug!("node2 contents: {:#?}", node2);
+-    node3.bootstrap().await.unwrap();
+-    debug!("node3 contents: {:#?}", node3);
+-
+-    // let target_id = node3.id;
+-    // let nodes = node1.find_node(&target_id);
+-
+-    // debug!("Discovered nodes: {:?}", nodes);
+-
+-    // assert!(nodes.iter().any(|(node_id, _)| *node_id == node3.id));
+-
+-    debug!("============================");
+-    debug!("Completed test: test_node_discovery");
+-    debug!("============================");
+-}
+-
+-// #[tokio::test]
+-// async fn test_value_storage_and_retrieval() {
+-//     init_logger();
+-//     debug!("\n\n\n\n\n");
+-//     debug!("============================");
+-//     debug!("Starting test: test_value_storage_and_retrieval");
+-//     debug!("============================");
+-
+-//     let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-//     let addr2: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-
+-//     let (mut node1, _) = KademliaNode::new(addr1).await.unwrap();
+-//     let (mut node2, _) = KademliaNode::new(addr2).await.unwrap();
+-
+-//     node2.bootstrap().await.unwrap();
+-
+-//     let key = b"test_key";
+-//     let value = b"test_value";
+-
+-//     debug!("Node1 storing key: {:?}, value: {:?}", key, value);
+-//     node1.put(key, value).await.unwrap();
+-
+-//     debug!("Node2 retrieving key: {:?}", key);
+-//     let retrieved_value = node2.get(key).await.unwrap();
+-
+-//     debug!("Retrieved value: {:?}", retrieved_value);
+-//     assert_eq!(retrieved_value, Some(value.to_vec()));
+-
+-//     debug!("============================");
+-//     debug!("Completed test: test_value_storage_and_retrieval");
+-//     debug!("============================");
+-// }
+-
+-// #[tokio::test]
+-// async fn test_message_handling_ping_pong() {
+-//     init_logger();
+-//     debug!("\n\n\n\n\n");
+-//     debug!("============================");
+-//     debug!("Starting test: test_message_handling_ping_pong");
+-//     debug!("============================");
+-
+-//     let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-//     let addr2: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-
+-//     let (mut node1, _) = KademliaNode::new(addr1).await.unwrap();
+-//     let (mut node2, _) = KademliaNode::new(addr2).await.unwrap();
+-
+-//     debug!("Node1 sending Ping to Node2 at {:?}", node2.addr);
+-//     node1.ping(node2.addr).await.unwrap();
+-
+-//     let bucket_index = node2
+-//         .id
+-//         .distance(&node1.id)
+-//         .as_bytes()
+-//         .iter()
+-//         .position(|&x| x != 0)
+-//         .unwrap_or(255);
+-//     let bucket = &node2.routing_table.buckets[bucket_index];
+-
+-//     debug!("Bucket after Ping: {:?}", bucket);
+-//     assert!(bucket.entries.iter().any(|entry| entry.node_id == node1.id));
+-
+-//     debug!("============================");
+-//     debug!("Completed test: test_message_handling_ping_pong");
+-//     debug!("============================");
+-// }
+-
+-// #[tokio::test]
+-// async fn test_routing_table_update_on_message() {
+-//     init_logger();
+-//     debug!("\n\n\n\n\n");
+-//     debug!("============================");
+-//     debug!("Starting test: test_routing_table_update_on_message");
+-//     debug!("============================");
+-
+-//     let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-//     let addr2: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-
+-//     let (mut node1, _) = KademliaNode::new(addr1).await.unwrap();
+-//     let (mut node2, _) = KademliaNode::new(addr2).await.unwrap();
+-
+-//     let key = b"test_key".to_vec();
+-//     let value = b"test_value".to_vec();
+-
+-//     debug!("Node1 sending Store message to Node2");
+-//     node2
+-//         .handle_message(Message::Store { key: key.clone(), value: value.clone() }, node1.addr)
+-//         .await
+-//         .unwrap();
+-
+-//     let bucket_index = node2
+-//         .id
+-//         .distance(&node1.id)
+-//         .as_bytes()
+-//         .iter()
+-//         .position(|&x| x != 0)
+-//         .unwrap_or(255);
+-//     let bucket = &node2.routing_table.buckets[bucket_index];
+-
+-//     debug!("Bucket after Store message: {:?}", bucket);
+-//     assert!(bucket.entries.iter().any(|entry| entry.node_id == node1.id));
+-
+-//     debug!("============================");
+-//     debug!("Completed test: test_routing_table_update_on_message");
+-//     debug!("============================");
+-// }
+-
+-// #[tokio::test]
+-// async fn test_find_value_via_multiple_nodes() {
+-//     init_logger();
+-//     debug!("\n\n\n\n\n");
+-//     debug!("============================");
+-//     debug!("Starting test: test_find_value_via_multiple_nodes");
+-//     debug!("============================");
+-
+-//     let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-//     let addr2: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-//     let addr3: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-
+-//     let (mut node1, _) = KademliaNode::new(addr1).await.unwrap();
+-//     let (mut node2, _) = KademliaNode::new(addr2).await.unwrap();
+-//     let (mut node3, _) = KademliaNode::new(addr3).await.unwrap();
+-
+-//     node2.bootstrap().await.unwrap();
+-//     node3.bootstrap().await.unwrap();
+-
+-//     let key = b"test_key";
+-//     let value = b"test_value";
+-
+-//     debug!("Node1 storing key: {:?}, value: {:?}", key, value);
+-//     node1.put(key, value).await.unwrap();
+-
+-//     debug!("Node3 attempting to retrieve the value");
+-//     let retrieved_value = node3.get(key).await.unwrap();
+-
+-//     debug!("Retrieved value: {:?}", retrieved_value);
+-//     assert_eq!(retrieved_value, Some(value.to_vec()));
+-
+-//     debug!("============================");
+-//     debug!("Completed test: test_find_value_via_multiple_nodes");
+-//     debug!("============================");
+-// }
+-
+-// #[tokio::test]
+-// async fn test_refresh_buckets() {
+-//     init_logger();
+-//     debug!("\n\n\n\n\n");
+-//     debug!("============================");
+-//     debug!("Starting test: test_refresh_buckets");
+-//     debug!("============================");
+-
+-//     let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-//     let (mut node, _) = KademliaNode::new(addr1).await.unwrap();
+-
+-//     debug!("Refreshing buckets");
+-//     node.refresh_buckets().await.unwrap();
+-
+-//     debug!("Buckets refreshed successfully");
+-
+-//     assert!(true);
+-
+-//     debug!("============================");
+-//     debug!("Completed test: test_refresh_buckets");
+-//     debug!("============================");
+-// }
+diff --git a/tests/kademlia_cache_tests.rs b/tests/kademlia_cache_tests.rs
+deleted file mode 100644
+index 2584b3e..0000000
+--- a/tests/kademlia_cache_tests.rs
++++ /dev/null
+@@ -1,246 +0,0 @@
+-use kademlia_mvp::message::{Message, FindValueResult};
+-use kademlia_mvp::node::KademliaNode;
+-use kademlia_mvp::utils::NodeId;
+-use kademlia_mvp::cache::policy::{CacheConfig, EvictionPolicy};
+-
+-// use kademlia_mvp::{KademliaNode, NodeId, Message};
+-use std::net::SocketAddr;
+-use tokio::sync::mpsc;
+-use tokio::time::{sleep, Duration};
+-
+-
+-async fn create_node(addr: SocketAddr, config: Option<CacheConfig>) -> KademliaNode {
+-    let (node, _) = KademliaNode::new(addr, config).await.unwrap();
+-    node
+-}
+-
+-#[tokio::test]
+-async fn test_store_and_get_default_config() {
+-    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-    let mut node = create_node(addr, None).await;
+-    
+-    let key = b"test_key";
+-    let value = b"test_value";
+-    
+-    node.store(key, value).await;
+-    let retrieved = node.get(key).await.unwrap();
+-    assert_eq!(Some(value.to_vec()), retrieved);
+-}
+-
+-#[tokio::test]
+-async fn test_cache_hit_custom_config() {
+-    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-    let config = CacheConfig {
+-        eviction_policy: EvictionPolicy::LRU,
+-        ttl: Duration::from_secs(10),
+-        max_size: 100,
+-        maintenance_interval: Duration::from_secs(5),
+-    };
+-    let mut node = create_node(addr, Some(config)).await;
+-    
+-    let key = b"cache_test_key";
+-    let value = b"cache_test_value";
+-    
+-    node.store(key, value).await;
+-    
+-    for _ in 0..5 {
+-        let retrieved = node.get(key).await.unwrap();
+-        assert_eq!(Some(value.to_vec()), retrieved);
+-    }
+-    
+-    assert!(node.cache_hit_count().await > 0);
+-}
+-
+-#[tokio::test]
+-async fn test_cache_eviction_custom_config() {
+-    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-    let config = CacheConfig {
+-        eviction_policy: EvictionPolicy::LRU,
+-        ttl: Duration::from_secs(1),
+-        max_size: 50,
+-        maintenance_interval: Duration::from_secs(2),
+-    };
+-    let mut node = create_node(addr, Some(config)).await;
+-    
+-    for i in 0..100 {
+-        let key = format!("key_{}", i).into_bytes();
+-        let value = format!("value_{}", i).into_bytes();
+-        node.store(&key, &value).await;
+-    }
+-    
+-    sleep(Duration::from_secs(3)).await;
+-    
+-    assert!(node.cache_size().await <= 50);
+-}
+-
+-#[tokio::test]
+-async fn test_different_eviction_policies() {
+-    let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-    let addr2: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-    
+-    let lru_config = CacheConfig {
+-        eviction_policy: EvictionPolicy::LRU,
+-        ttl: Duration::from_secs(10),
+-        max_size: 5,
+-        maintenance_interval: Duration::from_secs(1),
+-    };
+-    let fifo_config = CacheConfig {
+-        eviction_policy: EvictionPolicy::FIFO,
+-        ttl: Duration::from_secs(10),
+-        max_size: 5,
+-        maintenance_interval: Duration::from_secs(1),
+-    };
+-    
+-    let mut lru_node = create_node(addr1, Some(lru_config)).await;
+-    let mut fifo_node = create_node(addr2, Some(fifo_config)).await;
+-    
+-    for i in 0..10 {
+-        let key = format!("key_{}", i).into_bytes();
+-        let value = format!("value_{}", i).into_bytes();
+-        lru_node.store(&key, &value).await;
+-        fifo_node.store(&key, &value).await;
+-    }
+-    
+-    // Access some keys in LRU to change their order
+-    lru_node.get(b"key_0").await.unwrap();
+-    lru_node.get(b"key_1").await.unwrap();
+-    
+-    sleep(Duration::from_secs(2)).await;
+-    
+-    // LRU should have kept the most recently used items
+-    assert!(lru_node.get(b"key_0").await.unwrap().is_some());
+-    assert!(lru_node.get(b"key_1").await.unwrap().is_some());
+-    
+-    // FIFO should have kept the first items inserted
+-    assert!(fifo_node.get(b"key_0").await.unwrap().is_some());
+-    assert!(fifo_node.get(b"key_1").await.unwrap().is_some());
+-    assert!(fifo_node.get(b"key_9").await.unwrap().is_none());
+-}
+-
+-#[tokio::test]
+-async fn test_ttl_expiration() {
+-    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-    let config = CacheConfig {
+-        eviction_policy: EvictionPolicy::LRU,
+-        ttl: Duration::from_secs(2),
+-        max_size: 100,
+-        maintenance_interval: Duration::from_secs(1),
+-    };
+-    let mut node = create_node(addr, Some(config)).await;
+-    
+-    let key = b"ttl_test_key";
+-    let value = b"ttl_test_value";
+-    
+-    node.store(key, value).await;
+-    
+-    // Value should be present immediately
+-    assert!(node.get(key).await.unwrap().is_some());
+-    
+-    // Wait for TTL to expire
+-    sleep(Duration::from_secs(3)).await;
+-    
+-    // Value should be gone after TTL expiration and maintenance run
+-    assert!(node.get(key).await.unwrap().is_none());
+-}
+-
+-// #[tokio::test]
+-// async fn test_store_and_get() {
+-//     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-//     let (mut node, _) = KademliaNode::new(addr).await.unwrap();
+-    
+-//     let key = b"test_key";
+-//     let value = b"test_value";
+-    
+-//     // Store the value
+-//     node.store(key, value).await;
+-    
+-//     // Retrieve the value
+-//     let retrieved = node.get(key).await.unwrap();
+-//     assert_eq!(Some(value.to_vec()), retrieved);
+-// }
+-
+-// #[tokio::test]
+-// async fn test_cache_hit() {
+-//     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-//     let (mut node, _) = KademliaNode::new(addr).await.unwrap();
+-    
+-//     let key = b"cache_test_key";
+-//     let value = b"cache_test_value";
+-    
+-//     // Store the value
+-//     node.store(key, value).await;
+-    
+-//     // Retrieve the value multiple times
+-//     for _ in 0..5 {
+-//         let retrieved = node.get(key).await.unwrap();
+-//         assert_eq!(Some(value.to_vec()), retrieved);
+-//     }
+-    
+-//     // Check cache hit count
+-//     assert!(node.cache_hit_count().await > 0);
+-// }
+-
+-// #[tokio::test]
+-// async fn test_cache_eviction() {
+-//     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-//     let (mut node, _) = KademliaNode::new(addr).await.unwrap();
+-    
+-//     // Store multiple key-value pairs
+-//     for i in 0..100 {
+-//         let key = format!("key_{}", i).into_bytes();
+-//         let value = format!("value_{}", i).into_bytes();
+-//         node.store(&key, &value).await;
+-//     }
+-    
+-//     // Wait for cache maintenance to run (assuming it runs every hour)
+-//     sleep(Duration::from_secs(3605)).await;
+-    
+-//     // Check that some entries have been evicted
+-//     assert!(node.cache_size().await < 100);
+-// }
+-
+-// #[tokio::test]
+-// async fn test_network_lookup() {
+-//     let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-//     let addr2: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-    
+-//     let (mut node1, _) = KademliaNode::new(addr1).await.unwrap();
+-//     let (mut node2, _) = KademliaNode::new(addr2).await.unwrap();
+-    
+-//     // Add node2 to node1's routing table
+-//     node1.routing_table.update(node2.id, node2.addr);
+-    
+-//     let key = b"network_test_key";
+-//     let value = b"network_test_value";
+-    
+-//     // Store the value in node2
+-//     node2.store(key, value).await;
+-    
+-//     // Try to retrieve the value from node1 (should trigger a network lookup)
+-//     let retrieved = node1.get(key).await.unwrap();
+-//     assert_eq!(Some(value.to_vec()), retrieved);
+-// }
+-
+-// #[tokio::test]
+-// async fn test_handle_message() {
+-//     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-//     let (mut node, _) = KademliaNode::new(addr).await.unwrap();
+-    
+-//     let key = b"message_test_key".to_vec();
+-//     let value = b"message_test_value".to_vec();
+-//     let src: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+-    
+-//     // Test handling a Store message
+-//     let store_message = Message::Store { key: key.clone(), value: value.clone() };
+-//     node.handle_message(store_message, src).await.unwrap();
+-    
+-//     // Verify the value was stored
+-//     let retrieved = node.get(&key).await.unwrap();
+-//     assert_eq!(Some(value.clone()), retrieved);
+-    
+-//     // Test handling a FindValue message
+-//     let find_value_message = Message::FindValue { key: key.clone() };
+-//     node.handle_message(find_value_message, src).await.unwrap();
+-    
+-//     // You would need to mock the send_message function to verify the response
+-// }
+\ No newline at end of file

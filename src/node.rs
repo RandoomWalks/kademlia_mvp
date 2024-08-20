@@ -30,6 +30,7 @@ pub enum KademliaError {
     Timeout,
     UnexpectedResponse,
     InvalidData(&'static str),
+    InvalidMessage
 }
 
 impl From<std::io::Error> for KademliaError {
@@ -67,6 +68,7 @@ pub struct Config {
     pub cache_size: usize,
     pub cache_ttl: Duration,
     pub maintenance_interval: Duration,
+    
 }
 
 impl Default for Config {
@@ -156,12 +158,12 @@ pub struct KademliaNode {
     pub id: NodeId,
     pub addr: SocketAddr,
     pub routing_table: RoutingTable,
-    network_manager: NetworkManager,
-    storage_manager: StorageManager,
+    pub network_manager: NetworkManager,
+    pub storage_manager: StorageManager,
     pub shutdown: mpsc::Receiver<()>,
-    config: Arc<Config>,
-    time_provider: Arc<dyn TimeProvider>,
-    delay_provider: Arc<dyn Delay>,
+    pub config: Arc<Config>,
+    pub time_provider: Arc<dyn TimeProvider>,
+    pub delay_provider: Arc<dyn Delay>,
     pub bootstrap_nodes: Vec<SocketAddr>, // New field for bootstrap nodes
 
 }
@@ -229,8 +231,13 @@ impl KademliaNode {
                 result = self.network_manager.receive_message() => {
                     match result {
                         Ok((message, src)) => {
-                            if let Err(e) = self.handle_message(message, src).await {
-                                error!("Failed to handle message from {}: {:?}", src, e);
+                            match message {
+                                Message::ClientStore { .. } | Message::ClientGet { .. } => {
+                                    self.handle_client_message(message, src).await?;
+                                },
+                                _ => {
+                                    self.handle_message(message, src).await?;
+                                }
                             }
                         }
                         Err(e) => error!("Failed to receive message: {:?}", e),
@@ -320,6 +327,56 @@ impl KademliaNode {
                     .await
             }
         }
+    }
+
+    async fn handle_client_message(&mut self, message: Message, src: SocketAddr) -> Result<(), KademliaError> {
+        match message {
+            Message::ClientStore { key, value, sender } => self.handle_client_store(key, value, sender, src).await,
+            Message::ClientGet { key, sender } => self.handle_client_get(key, sender, src).await,
+            _ => Err(KademliaError::InvalidMessage),
+        }
+    }
+
+    async fn handle_client_store(&mut self, key: Vec<u8>, value: Vec<u8>, sender: NodeId, src: SocketAddr) -> Result<(), KademliaError> {
+        debug!("Handling client STORE request for key: {:?}", key);
+        self.validate_key_value(&key, &value)?;
+        self.storage_manager.store(&key, &value).await?;
+        self.replicate_store(key, value).await?;
+        self.send_client_store_response(true, None, src).await
+    }
+
+    async fn handle_client_get(&self, key: Vec<u8>, sender: NodeId, src: SocketAddr) -> Result<(), KademliaError> {
+        debug!("Handling client GET request for key: {:?}", key);
+        match self.storage_manager.get(&key).await {
+            Some(value) => self.send_client_get_response(Some(value), None, src).await,
+            None => {
+                let result = self.find_value(&key).await;
+                match result {
+                    FindValueResult::Value(value) => self.send_client_get_response(Some(value), None, src).await,
+                    FindValueResult::Nodes(_) => self.send_client_get_response(None, Some("Value not found".to_string()), src).await,
+                }
+            }
+        }
+    }
+
+    async fn replicate_store(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), KademliaError> {
+        let closest_nodes = self.find_node(NodeId::from_slice(&key[..].try_into().unwrap())).await?;
+        for (_, addr) in closest_nodes.iter().take(self.config.alpha) {
+            if let Err(e) = self.send_store_message(&key, &value, *addr).await {
+                warn!("Failed to replicate store to {}: {:?}", addr, e);
+            }
+        }
+        Ok(())
+    }
+
+    async fn send_client_store_response(&self, success: bool, error_message: Option<String>, dst: SocketAddr) -> Result<(), KademliaError> {
+        let response = Message::ClientStoreResponse { success, error_message };
+        self.network_manager.send_message(&response, dst).await
+    }
+
+    async fn send_client_get_response(&self, value: Option<Vec<u8>>, error_message: Option<String>, dst: SocketAddr) -> Result<(), KademliaError> {
+        let response = Message::ClientGetResponse { value, error_message };
+        self.network_manager.send_message(&response, dst).await
     }
 
     fn validate_key_value(&self, key: &[u8], value: &[u8]) -> Result<(), KademliaError> {
