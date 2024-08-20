@@ -28,6 +28,7 @@ pub enum KademliaError {
     Network(std::io::Error),
     Serialization(bincode::Error),
     Timeout,
+    InvalidKeyLength,
     UnexpectedResponse,
     InvalidData(&'static str),
     InvalidMessage
@@ -257,7 +258,7 @@ impl KademliaNode {
         Ok(())
     }
 
-    async fn handle_message(
+    pub async fn handle_message(
         &mut self,
         message: Message,
         src: SocketAddr,
@@ -279,14 +280,14 @@ impl KademliaNode {
         }
     }
 
-    async fn handle_ping(&mut self, sender: NodeId, src: SocketAddr) -> Result<(), KademliaError> {
+    pub async fn handle_ping(&mut self, sender: NodeId, src: SocketAddr) -> Result<(), KademliaError> {
         self.routing_table.update(sender, src);
         self.network_manager
             .send_message(&Message::Pong { sender: self.id }, src)
             .await
     }
 
-    async fn handle_store(
+    pub async fn handle_store(
         &mut self,
         key: Vec<u8>,
         value: Vec<u8>,
@@ -308,13 +309,13 @@ impl KademliaNode {
             .await
     }
 
-    async fn handle_find_node(&self, target: NodeId, src: SocketAddr) -> Result<(), KademliaError> {
+    pub async fn handle_find_node(&self, target: NodeId, src: SocketAddr) -> Result<(), KademliaError> {
         let closest_nodes = self.routing_table.find_closest(&target, self.config.k);
         let response = Message::NodesFound(closest_nodes);
         self.network_manager.send_message(&response, src).await
     }
 
-    async fn handle_find_value(&self, key: Vec<u8>, src: SocketAddr) -> Result<(), KademliaError> {
+    pub async fn handle_find_value(&self, key: Vec<u8>, src: SocketAddr) -> Result<(), KademliaError> {
         match self.find_value(&key).await {
             FindValueResult::Value(value) => {
                 self.network_manager
@@ -329,7 +330,7 @@ impl KademliaNode {
         }
     }
 
-    async fn handle_client_message(&mut self, message: Message, src: SocketAddr) -> Result<(), KademliaError> {
+    pub async fn handle_client_message(&mut self, message: Message, src: SocketAddr) -> Result<(), KademliaError> {
         match message {
             Message::ClientStore { key, value, sender } => self.handle_client_store(key, value, sender, src).await,
             Message::ClientGet { key, sender } => self.handle_client_get(key, sender, src).await,
@@ -337,7 +338,7 @@ impl KademliaNode {
         }
     }
 
-    async fn handle_client_store(&mut self, key: Vec<u8>, value: Vec<u8>, sender: NodeId, src: SocketAddr) -> Result<(), KademliaError> {
+    pub async fn handle_client_store(&mut self, key: Vec<u8>, value: Vec<u8>, sender: NodeId, src: SocketAddr) -> Result<(), KademliaError> {
         debug!("Handling client STORE request for key: {:?}", key);
         self.validate_key_value(&key, &value)?;
         self.storage_manager.store(&key, &value).await?;
@@ -345,7 +346,7 @@ impl KademliaNode {
         self.send_client_store_response(true, None, src).await
     }
 
-    async fn handle_client_get(&self, key: Vec<u8>, sender: NodeId, src: SocketAddr) -> Result<(), KademliaError> {
+    pub async fn handle_client_get(&self, key: Vec<u8>, sender: NodeId, src: SocketAddr) -> Result<(), KademliaError> {
         debug!("Handling client GET request for key: {:?}", key);
         match self.storage_manager.get(&key).await {
             Some(value) => self.send_client_get_response(Some(value), None, src).await,
@@ -359,8 +360,18 @@ impl KademliaNode {
         }
     }
 
-    async fn replicate_store(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), KademliaError> {
-        let closest_nodes = self.find_node(NodeId::from_slice(&key[..].try_into().unwrap())).await?;
+    pub async fn replicate_store(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), KademliaError> {
+        let nodeID = match &key[..].try_into() {
+            Ok(arr) => {
+                NodeId::from_slice(arr)
+            }
+            Err(_) => {
+                return Err(KademliaError::InvalidKeyLength);
+            }
+        };
+
+        let closest_nodes = self.find_node(nodeID).await?;
+        
         for (_, addr) in closest_nodes.iter().take(self.config.alpha) {
             if let Err(e) = self.send_store_message(&key, &value, *addr).await {
                 warn!("Failed to replicate store to {}: {:?}", addr, e);
@@ -369,12 +380,12 @@ impl KademliaNode {
         Ok(())
     }
 
-    async fn send_client_store_response(&self, success: bool, error_message: Option<String>, dst: SocketAddr) -> Result<(), KademliaError> {
+    pub async fn send_client_store_response(&self, success: bool, error_message: Option<String>, dst: SocketAddr) -> Result<(), KademliaError> {
         let response = Message::ClientStoreResponse { success, error_message };
         self.network_manager.send_message(&response, dst).await
     }
 
-    async fn send_client_get_response(&self, value: Option<Vec<u8>>, error_message: Option<String>, dst: SocketAddr) -> Result<(), KademliaError> {
+    pub async fn send_client_get_response(&self, value: Option<Vec<u8>>, error_message: Option<String>, dst: SocketAddr) -> Result<(), KademliaError> {
         let response = Message::ClientGetResponse { value, error_message };
         self.network_manager.send_message(&response, dst).await
     }
@@ -396,7 +407,7 @@ impl KademliaNode {
         }
     }
 
-    async fn find_value(&self, key: &[u8]) -> FindValueResult {
+    pub async fn find_value(&self, key: &[u8]) -> FindValueResult {
         // First, check local storage
         if let Some(value) = self.storage_manager.get(key).await {
             return FindValueResult::Value(value);
@@ -441,7 +452,7 @@ impl KademliaNode {
         FindValueResult::Nodes(closest_nodes)
     }
 
-    async fn send_find_value_message(&self, key: &[u8], addr: SocketAddr) -> Result<Message, KademliaError> {
+    pub async fn send_find_value_message(&self, key: &[u8], addr: SocketAddr) -> Result<Message, KademliaError> {
         let message = Message::FindValue { key: key.to_vec() };
         self.network_manager.send_message(&message, addr).await?;
 
@@ -457,7 +468,7 @@ impl KademliaNode {
         }
     }
 
-    async fn ping(&self, addr: SocketAddr) -> Result<(), KademliaError> {
+    pub async fn ping(&self, addr: SocketAddr) -> Result<(), KademliaError> {
         self.network_manager
             .send_message(&Message::Ping { sender: self.id }, addr)
             .await
@@ -533,7 +544,7 @@ impl KademliaNode {
         Ok(None)
     }
 
-    async fn refresh_buckets(&mut self) -> Result<(), KademliaError> {
+    pub async fn refresh_buckets(&mut self) -> Result<(), KademliaError> {
         for bucket in &self.routing_table.buckets {
             if let Some(node) = bucket.entries.first() {
                 if let Err(e) = self.ping(node.addr).await {
@@ -611,7 +622,7 @@ impl KademliaNode {
         Ok(closest_nodes)
     }
 
-    async fn find_node_rpc(
+    pub async fn find_node_rpc(
         &self,
         node_id: NodeId,
         addr: SocketAddr,
@@ -634,7 +645,7 @@ impl KademliaNode {
         }
     }
 
-    async fn send_store_message(
+    pub async fn send_store_message(
         &self,
         key: &[u8],
         value: &[u8],

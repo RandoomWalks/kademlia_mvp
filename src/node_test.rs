@@ -143,3 +143,65 @@ async fn test_put_and_get() {
 
     println!("All tests passed!");
 }
+
+#[tokio::test]
+async fn test_client_store_and_get() -> Result<(), KademliaError> {
+    // Create a mock config
+    let config = Config::default();
+
+    // Create a mock socket
+    // let socket: Arc<dyn NetworkInterface> = Arc::new(MockNetworkInterface);
+
+    // // Create mock time and delay providers
+    // let time_provider = Arc::new(MockTimeProvider);
+    // let delay_provider = Arc::new(MockDelayProvider);
+
+    let mock_network = Arc::new(MockNetworkInterface {
+        sent_messages: Arc::new(Mutex::new(Vec::new())),
+        received_messages: Arc::new(Mutex::new(Vec::new())),
+        stored_data: Arc::new(Mutex::new(HashMap::new())),
+    });
+    let mock_time_provider = Arc::new(MockTimeProvider);
+    let mock_delay_provider = Arc::new(MockDelay);
+
+
+    // Create a test node
+    let (mut node, _shutdown_sender) = KademliaNode::new(
+        "127.0.0.1:8000".parse().unwrap(),
+        Some(config),
+        mock_network,
+        mock_time_provider,
+        mock_delay_provider,
+        vec!["127.0.0.1:8001".parse().unwrap()], // Mock bootstrap nodes
+    ).await?;
+
+    // Test client STORE
+    let key = b"test_key".to_vec();
+    let value = b"test_value".to_vec();
+    let client_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+    node.handle_client_message(
+        Message::ClientStore {
+            key: key.clone(),
+            value: value.clone(),
+            sender: NodeId::new(),
+        },
+        client_addr,
+    ).await?;
+
+    // Test client GET
+    let get_result = node.handle_client_message(
+        Message::ClientGet {
+            key: key.clone(),
+            sender: NodeId::new(),
+        },
+        client_addr,
+    ).await?;
+
+    // Assert that the GET result matches the stored value
+    match get_result {
+        _ => panic!("Unexpected response from client GET"),
+    }
+
+    Ok(())
+}
