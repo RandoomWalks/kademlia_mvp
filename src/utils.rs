@@ -7,10 +7,40 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
+use tokio::time::{interval, Duration};
+use std::pin::Pin;
+use std::future::Future;
+// use crate::interfaces::{NetworkInterface,TimeProvider, Delay};
 
 pub const K: usize = 20; // Maximum number of nodes in a k-bucket
 pub const ALPHA: usize = 3; // Number of parallel lookups
 pub const BOOTSTRAP_NODES: [&str; 1] = ["127.0.0.1:33333"]; // Hardcoded bootstrap node
+
+
+// Error types
+#[derive(Debug)]
+pub enum KademliaError {
+    Network(std::io::Error),
+    Serialization(bincode::Error),
+    Timeout,
+    InvalidKeyLength,
+    UnexpectedResponse,
+    InvalidData(&'static str),
+    InvalidMessage,
+}
+
+impl From<std::io::Error> for KademliaError {
+    fn from(error: std::io::Error) -> Self {
+        KademliaError::Network(error)
+    }
+}
+
+impl From<bincode::Error> for KademliaError {
+    fn from(error: bincode::Error) -> Self {
+        KademliaError::Serialization(error)
+    }
+}
+
 
 /// Struct representing a unique identifier for a node in the network.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -107,6 +137,14 @@ impl Ord for NodeId {
     }
 }
 
+impl From<NodeId> for Vec<u8> {
+    // call like : let vec: Vec<u8> = new_node.into();
+
+    fn from(node_id: NodeId) -> Self {
+        node_id.0.to_vec()
+    }
+}
+
 impl PartialOrd for NodeId {
     /// Partially compares two `NodeId` instances for ordering.
     ///
@@ -126,10 +164,27 @@ pub trait NetworkInterface: Send + Sync {
     fn send_to(&self, buf: &[u8], addr: SocketAddr) -> std::io::Result<usize>;
     fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)>;
 }
-
 pub trait TimeProvider: Send + Sync {
     fn now(&self) -> SystemTime;
 }
+
+pub trait Delay: Send + Sync {
+    fn delay(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+}
+
+// Traits
+// pub trait NetworkInterface: Send + Sync {
+//     fn send_to(&self, buf: &[u8], addr: SocketAddr) -> std::io::Result<usize>;
+//     fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)>;
+// }
+
+// pub trait TimeProvider: Send + Sync {
+//     fn now(&self) -> SystemTime;
+// }
+
+// pub trait Delay: Send + Sync {
+//     fn delay(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+// }
 
 pub struct NetworkManager {
     socket: Arc<dyn NetworkInterface>,
@@ -153,5 +208,30 @@ impl NetworkManager {
         let message: Message = bincode::deserialize(&buf[..size])
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
         Ok((message, src))
+    }
+}
+
+
+// Configuration
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub k: usize,
+    pub alpha: usize,
+    pub request_timeout: Duration,
+    pub cache_size: usize,
+    pub cache_ttl: Duration,
+    pub maintenance_interval: Duration,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            k: 20,
+            alpha: 3,
+            request_timeout: Duration::from_secs(5),
+            cache_size: 1000,
+            cache_ttl: Duration::from_secs(3600),
+            maintenance_interval: Duration::from_secs(3600),
+        }
     }
 }
