@@ -162,6 +162,8 @@ pub struct KademliaNode {
     config: Arc<Config>,
     time_provider: Arc<dyn TimeProvider>,
     delay_provider: Arc<dyn Delay>,
+    pub bootstrap_nodes: Vec<SocketAddr>, // New field for bootstrap nodes
+
 }
 
 impl fmt::Debug for KademliaNode {
@@ -181,6 +183,8 @@ impl KademliaNode {
         socket: Arc<dyn NetworkInterface>,
         time_provider: Arc<dyn TimeProvider>,
         delay_provider: Arc<dyn Delay>,
+        bootstrap_nodes: Vec<SocketAddr>, // New parameter
+
     ) -> Result<(Self, mpsc::Sender<()>), KademliaError> {
         let id = NodeId::new();
         let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
@@ -198,19 +202,20 @@ impl KademliaNode {
                 config,
                 time_provider,
                 delay_provider,
+                bootstrap_nodes,
             },
             shutdown_sender,
         ))
     }
 
     pub async fn bootstrap(&mut self) -> Result<(), KademliaError> {
-        for &bootstrap_addr in BOOTSTRAP_NODES.iter() {
-            if let Ok(addr) = bootstrap_addr.parse::<SocketAddr>() {
-                if let Err(e) = self.ping(addr).await {
-                    warn!("Failed to ping bootstrap node {}: {:?}", bootstrap_addr, e);
-                }
+        for &bootstrap_addr in &self.bootstrap_nodes {
+            if let Err(e) = self.ping(bootstrap_addr).await {
+                warn!("Failed to ping bootstrap node {}: {:?}", bootstrap_addr, e);
             } else {
-                warn!("Invalid bootstrap address: {}", bootstrap_addr);
+                // If ping succeeds, add the node to the routing table
+                let node_id = NodeId::new(); // Generate a random ID for the bootstrap node
+                self.routing_table.update(node_id, bootstrap_addr);
             }
         }
         Ok(())
@@ -360,15 +365,23 @@ impl KademliaNode {
     }
 
     pub async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), KademliaError> {
+        debug!("Attempting to store key: {:?}, value: {:?}", key, value);
+
         self.validate_key_value(key, value)?;
         self.storage_manager.store(key, value).await?;
 
         let hash = StorageManager::hash_key(key);
         let target = NodeId::from_slice(&hash[..32].try_into().unwrap());
         let closest_nodes = self.find_node(target).await?;
-
+        if closest_nodes.is_empty() {
+            error!("No closest nodes found for storage");
+            return Err(KademliaError::InvalidData("No nodes available for storage"));
+        }
+    
         let mut success_count = 0;
         for (node_id, addr) in closest_nodes.iter().take(self.config.alpha) {
+            debug!("Sending store request to node: {:?} at address: {:?}", node_id, addr);
+
             if *node_id != self.id {
                 match self.send_store_message(key, value, *addr).await {
                     Ok(true) => success_count += 1,
@@ -378,7 +391,9 @@ impl KademliaNode {
             }
         }
 
-        if success_count == 0 {
+        if success_count == 0 && !closest_nodes.is_empty() {
+            error!("Failed to store on any node");
+
             Err(KademliaError::InvalidData("Failed to store on any node"))
         } else {
             Ok(())
