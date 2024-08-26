@@ -20,7 +20,7 @@ tempfile = "3.2"
 hex="*"
 thiserror="*"
 async-trait = "0.1"
-
+backtrace = "0.3"
 
 [[bin]]
 name = "kademlia_mvp"

@@ -4,6 +4,8 @@ use log::{info, debug};
 use std::net::SocketAddr;
 use std::collections::BinaryHeap;
 use std::fmt;
+use std::backtrace::Backtrace;
+
 
 /// Struct representing the routing table of a Kademlia DHT node.
 pub struct RoutingTable {
@@ -48,11 +50,22 @@ impl RoutingTable {
     /// # Output
     ///
     /// This function does not return any value but updates the internal state of the routing table.
+
     pub fn update(&mut self, node: NodeId, addr: SocketAddr) {
         let distance = self.node_id.distance(&node); // Calculate distance between current node and the target node
         let bucket_index = distance.as_bytes().iter().position(|&x| x != 0).unwrap_or(255); // Determine the appropriate k-bucket index based on distance
         self.buckets[bucket_index].update(node, addr); // Update the corresponding k-bucket with the node's information
-        debug!("Updated routing table for node {:?}", node);
+        // debug!("Updated routing table for node {:?}", node);
+        debug!(
+            "RoutingTable::update() Updated routing table with node {:?} at address {}",
+            node, addr
+        );
+        let bt = Backtrace::capture();
+        debug!(
+            "{:?}",
+            bt
+        );
+
     }
 
     /// Finds the closest nodes to a given target ID.

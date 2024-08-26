@@ -3,7 +3,7 @@ use crate::cache::entry;
 use crate::cache::policy;
 use crate::message::{FindValueResult, Message};
 use crate::routing_table::RoutingTable;
-use crate::utils::{NodeId,KademliaError};
+use crate::utils::{KademliaError, NodeId};
 
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -17,11 +17,11 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use tokio::time::sleep;
 use tokio::time::{interval, Duration};
-
 // use crate::interfaces::{NetworkInterface,TimeProvider, Delay};
 
-use crate::utils::{ALPHA, BOOTSTRAP_NODES, K, Config};
+use crate::utils::{Config, ALPHA, BOOTSTRAP_NODES, K};
 
 use bincode::{deserialize, serialize};
 
@@ -113,7 +113,6 @@ impl StorageManager {
     }
 }
 
-
 // Kademlia Node
 pub struct KademliaNode {
     pub id: NodeId,
@@ -163,17 +162,86 @@ impl KademliaNode {
         ))
     }
 
-
-
     pub async fn bootstrap(&mut self) -> Result<(), KademliaError> {
+        info!("Node {:?} starting bootstrap process", self.id);
+
+        let mut successful_contacts = Vec::new();
+
         for &bootstrap_addr in &self.bootstrap_nodes {
-            if let Err(e) = self.ping(bootstrap_addr).await {
-                warn!("Failed to ping bootstrap node {}: {:?}", bootstrap_addr, e);
-            } else {
-                let node_id = NodeId::new();
-                self.routing_table.update(node_id, bootstrap_addr);
+            for attempt in 1..=3 {
+                match self.ping(bootstrap_addr).await {
+                    Ok(_) => {
+                        info!("Successfully pinged bootstrap node at {}", bootstrap_addr);
+                        successful_contacts.push(bootstrap_addr);
+                        break; // Break out of the retry loop on success
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to ping bootstrap node at {}: {:?}. Retrying in {}ms...",
+                            bootstrap_addr,
+                            e,
+                            attempt * 500
+                        );
+                        sleep(Duration::from_millis(attempt * 500)).await; // Exponential backoff
+                    }
+                }
             }
         }
+
+        // After pinging all bootstrap nodes
+        if successful_contacts.is_empty() {
+            warn!("No bootstrap nodes responded. Marking this node as the first in the network.");
+            self.routing_table.update(self.id, self.addr); // Manually add itself to the routing table
+            debug!(
+                "Updated routing table with node {:?} at address {}",
+                self.id, self.addr
+            );
+
+            return Ok(()); // Exit the bootstrap process as this node is now the first node
+        }
+
+        for &contact in &successful_contacts {
+            match self.find_node(self.id).await {
+                Ok(nodes) => {
+                    info!(
+                        "Found {} nodes from bootstrap node {}",
+                        nodes.len(),
+                        contact
+                    );
+                    for (node_id, addr) in nodes {
+                        self.routing_table.update(node_id, addr);
+                        debug!(
+                            "Updated routing table with node {:?} at address {}",
+                            node_id, addr
+                        );
+
+                        if self.ping(addr).await.is_ok() {
+                            info!(
+                                "Successfully pinged and added node {:?} at {} to routing table",
+                                node_id, addr
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to find nodes from bootstrap node {}: {:?}",
+                        contact, e
+                    );
+                }
+            }
+        }
+
+        let table_size = self.get_routing_table_size();
+        info!(
+            "Bootstrap process completed for node {:?}. Routing table size: {}",
+            self.id, table_size
+        );
+
+        if table_size == 0 {
+            warn!("Routing table is empty after bootstrap. This might be the first node in the network.");
+        }
+
         Ok(())
     }
 
@@ -240,6 +308,11 @@ impl KademliaNode {
         src: SocketAddr,
     ) -> Result<(), KademliaError> {
         self.routing_table.update(sender, src);
+        debug!(
+            "handle_ping:: Updated routing table with node {:?} at address {}",
+            sender, src
+        );
+
         self.network_manager
             .send_message(&Message::Pong { sender: self.id }, src)
             .await
@@ -259,6 +332,8 @@ impl KademliaNode {
         self.storage_manager.store(&key, &value).await?;
 
         self.routing_table.update(sender, src);
+        debug!("handle_store:: Updated routing table with node {:?} at address {}", sender,src);
+
         self.network_manager
             .send_message(
                 &Message::StoreResponse {
@@ -492,14 +567,29 @@ impl KademliaNode {
     }
 
     pub async fn ping(&self, addr: SocketAddr) -> Result<(), KademliaError> {
+        debug!("Pinging node at {}", addr);
         self.network_manager
             .send_message(&Message::Ping { sender: self.id }, addr)
-            .await
+            .await?;
+
+        match tokio::time::timeout(
+            self.config.request_timeout,
+            self.network_manager.receive_message(),
+        )
+        .await
+        {
+            Ok(Ok((Message::Pong { sender }, _))) => {
+                debug!("Received pong from {:?} at {}", sender, addr);
+                Ok(())
+            }
+            Ok(Ok(_)) => Err(KademliaError::UnexpectedResponse),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(KademliaError::Timeout),
+        }
     }
 
     pub async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), KademliaError> {
-        debug!("Attempting to store key: {:?}, value: {:?}", key, value);
-
+        info!("Attempting to store key: {:?}", key);
         self.validate_key_value(key, value)?;
         self.storage_manager.store(key, value).await?;
 
@@ -511,27 +601,32 @@ impl KademliaNode {
             return Err(KademliaError::InvalidData("No nodes available for storage"));
         }
 
+        info!(
+            "Found {} closest nodes for replication",
+            closest_nodes.len()
+        );
         let mut success_count = 0;
         for (node_id, addr) in closest_nodes.iter().take(self.config.alpha) {
-            debug!(
-                "Sending store request to node: {:?} at address: {:?}",
-                node_id, addr
-            );
-
             if *node_id != self.id {
                 match self.send_store_message(key, value, *addr).await {
-                    Ok(true) => success_count += 1,
-                    Ok(false) => warn!("Store operation failed on node {:#?}", node_id),
-                    Err(e) => warn!("Error sending STORE to node {:#?}: {:#?}", node_id, e),
+                    Ok(true) => {
+                        success_count += 1;
+                        info!("Successfully stored data on node {:?} at {}", node_id, addr);
+                    }
+                    Ok(false) => warn!("Store operation failed on node {:?} at {}", node_id, addr),
+                    Err(e) => warn!(
+                        "Error sending STORE to node {:?} at {}: {:?}",
+                        node_id, addr, e
+                    ),
                 }
             }
         }
 
         if success_count == 0 && !closest_nodes.is_empty() {
             error!("Failed to store on any node");
-
             Err(KademliaError::InvalidData("Failed to store on any node"))
         } else {
+            info!("Successfully stored data on {} nodes", success_count);
             Ok(())
         }
     }
