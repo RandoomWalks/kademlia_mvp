@@ -11,6 +11,7 @@ use tokio::time::{interval, Duration};
 use std::pin::Pin;
 use std::future::Future;
 // use crate::interfaces::{NetworkInterface,TimeProvider, Delay};
+use std::error::Error;
 
 pub const K: usize = 20; // Maximum number of nodes in a k-bucket
 pub const ALPHA: usize = 3; // Number of parallel lookups
@@ -35,9 +36,38 @@ impl From<std::io::Error> for KademliaError {
     }
 }
 
+// impl<E: std::error::Error + 'static> From<E> for KademliaError {
+//     fn from(error: E) -> Self {
+//         KademliaError::Network(Box::new(error))
+//     }
+// }
+
 impl From<bincode::Error> for KademliaError {
     fn from(error: bincode::Error) -> Self {
         KademliaError::Serialization(error)
+    }
+}
+impl fmt::Display for KademliaError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            KademliaError::Network(e) => write!(f, "Network error: {}", e),
+            KademliaError::Serialization(e) => write!(f, "Serialization error: {}", e),
+            KademliaError::Timeout => write!(f, "Operation timed out"),
+            KademliaError::InvalidKeyLength => write!(f, "Invalid key length"),
+            KademliaError::UnexpectedResponse => write!(f, "Unexpected response received"),
+            KademliaError::InvalidData(msg) => write!(f, "Invalid data: {}", msg),
+            KademliaError::InvalidMessage => write!(f, "Invalid message"),
+        }
+    }
+}
+
+impl Error for KademliaError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            KademliaError::Network(e) => Some(e),
+            KademliaError::Serialization(e) => Some(e),
+            _ => None,
+        }
     }
 }
 

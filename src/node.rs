@@ -22,29 +22,19 @@ use tokio::time::{interval, Duration};
 // use crate::interfaces::{NetworkInterface,TimeProvider, Delay};
 
 use crate::utils::{ALPHA, BOOTSTRAP_NODES, K, Config};
+
 use bincode::{deserialize, serialize};
 
-
-pub trait NetworkInterface: Send + Sync {
-    fn send_to(&self, buf: &[u8], addr: SocketAddr) -> std::io::Result<usize>;
-    fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)>;
-}
-pub trait TimeProvider: Send + Sync {
-    fn now(&self) -> SystemTime;
-}
-
-pub trait Delay: Send + Sync {
-    fn delay(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>>;
-}
+use async_trait::async_trait;
 
 // Network Manager
 pub struct NetworkManager {
-    socket: Arc<dyn NetworkInterface>,
+    socket: Arc<UdpSocket>,
     config: Arc<Config>,
 }
 
 impl NetworkManager {
-    pub fn new(socket: Arc<dyn NetworkInterface>, config: Arc<Config>) -> Self {
+    pub fn new(socket: Arc<UdpSocket>, config: Arc<Config>) -> Self {
         NetworkManager { socket, config }
     }
 
@@ -54,13 +44,13 @@ impl NetworkManager {
         dst: SocketAddr,
     ) -> Result<(), KademliaError> {
         let serialized = bincode::serialize(message)?;
-        self.socket.send_to(&serialized, dst)?;
+        self.socket.send_to(&serialized, dst).await?;
         Ok(())
     }
 
     pub async fn receive_message(&self) -> Result<(Message, SocketAddr), KademliaError> {
         let mut buf = vec![0u8; 1024];
-        let (size, src) = self.socket.recv_from(&mut buf)?;
+        let (size, src) = self.socket.recv_from(&mut buf).await?;
         let message: Message = bincode::deserialize(&buf[..size])?;
         Ok((message, src))
     }
@@ -123,6 +113,7 @@ impl StorageManager {
     }
 }
 
+
 // Kademlia Node
 pub struct KademliaNode {
     pub id: NodeId,
@@ -132,9 +123,7 @@ pub struct KademliaNode {
     pub storage_manager: StorageManager,
     pub shutdown: mpsc::Receiver<()>,
     pub config: Arc<Config>,
-    pub time_provider: Arc<dyn TimeProvider>,
-    pub delay_provider: Arc<dyn Delay>,
-    pub bootstrap_nodes: Vec<SocketAddr>, // New field for bootstrap nodes
+    pub bootstrap_nodes: Vec<SocketAddr>,
 }
 
 impl fmt::Debug for KademliaNode {
@@ -149,13 +138,11 @@ impl fmt::Debug for KademliaNode {
 
 impl KademliaNode {
     pub async fn new(
-        addr: SocketAddr,
+        socket: Arc<UdpSocket>,
         config: Option<Config>,
-        socket: Arc<dyn NetworkInterface>,
-        time_provider: Arc<dyn TimeProvider>,
-        delay_provider: Arc<dyn Delay>,
-        bootstrap_nodes: Vec<SocketAddr>, // New parameter
+        bootstrap_nodes: Vec<SocketAddr>,
     ) -> Result<(Self, mpsc::Sender<()>), KademliaError> {
+        let addr = socket.local_addr()?;
         let id = NodeId::new();
         let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
 
@@ -170,21 +157,20 @@ impl KademliaNode {
                 storage_manager: StorageManager::new(config.clone()),
                 shutdown: shutdown_receiver,
                 config,
-                time_provider,
-                delay_provider,
                 bootstrap_nodes,
             },
             shutdown_sender,
         ))
     }
 
+
+
     pub async fn bootstrap(&mut self) -> Result<(), KademliaError> {
         for &bootstrap_addr in &self.bootstrap_nodes {
             if let Err(e) = self.ping(bootstrap_addr).await {
                 warn!("Failed to ping bootstrap node {}: {:?}", bootstrap_addr, e);
             } else {
-                // If ping succeeds, add the node to the routing table
-                let node_id = NodeId::new(); // Generate a random ID for the bootstrap node
+                let node_id = NodeId::new();
                 self.routing_table.update(node_id, bootstrap_addr);
             }
         }
@@ -205,8 +191,7 @@ impl KademliaNode {
                                 },
                                 _ => {
                                     self.handle_message(message, src).await?;
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
+                                    tokio::time::sleep(Duration::from_millis(100)).await;
                                 }
                             }
                         }
@@ -696,7 +681,7 @@ impl KademliaNode {
             key: key.to_vec(),
             value: value.to_vec(),
             sender: self.id,
-            timestamp: self.time_provider.now(),
+            timestamp: SystemTime::now(),
         };
         self.network_manager.send_message(&message, addr).await?;
 
