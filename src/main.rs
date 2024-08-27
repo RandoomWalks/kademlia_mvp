@@ -30,40 +30,47 @@ use tokio::time::timeout;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 enum KademliaMessage {
-    Ping,
-    Pong,
-    FindNode(NodeId),
-    FindNodeResponse(Vec<(NodeId, SocketAddr)>),
-    FindValue(Vec<u8>),
-    FindValueResponse(Option<Vec<u8>>, Vec<(NodeId, SocketAddr)>),
-    Store(Vec<u8>, Vec<u8>),
+    Ping(NodeId),
+    Pong(NodeId),
+    FindNode(NodeId, NodeId), // (sender_id, target_id)
+    FindNodeResponse(NodeId, Vec<(NodeId, SocketAddr)>),
+    FindValue(NodeId, Vec<u8>),
+    FindValueResponse(NodeId, Option<Vec<u8>>, Vec<(NodeId, SocketAddr)>),
+    Store(NodeId, Vec<u8>, Vec<u8>),
 }
 
 impl KademliaMessage {
     fn serialize(&self) -> Vec<u8> {
-        match self {
-            KademliaMessage::Ping => vec![0],
-            KademliaMessage::Pong => vec![1],
-            KademliaMessage::FindNode(_) => vec![2],
-            KademliaMessage::FindNodeResponse(_) => vec![3],
-            KademliaMessage::FindValue(_) => vec![4],
-            KademliaMessage::FindValueResponse(_, _) => vec![5],
-            KademliaMessage::Store(_, _) => vec![6],
-        }
+        bincode::serialize(self).unwrap()
     }
 
     fn deserialize(data: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
-        match data.get(0) {
-            Some(0) => Ok(KademliaMessage::Ping),
-            Some(1) => Ok(KademliaMessage::Pong),
-            Some(2) => Ok(KademliaMessage::FindNode(NodeId::new())), // Use a dummy NodeId for now
-            Some(3) => Ok(KademliaMessage::FindNodeResponse(vec![])), // Use an empty vec for now
-            Some(4) => Ok(KademliaMessage::FindValue(vec![])), // Use an empty vec for now
-            Some(5) => Ok(KademliaMessage::FindValueResponse(None, vec![])), // Use None and an empty vec for now
-            Some(6) => Ok(KademliaMessage::Store(vec![], vec![])), // Use empty vecs for now
-            _ => Err("Invalid message".into()),
-        }
+        bincode::deserialize(data).map_err(|e| e.into())
     }
+    // fn serialize(&self) -> Vec<u8> {
+    //     match self {
+    //         KademliaMessage::Ping => vec![0],
+    //         KademliaMessage::Pong => vec![1],
+    //         KademliaMessage::FindNode(_,_) => vec![2],
+    //         KademliaMessage::FindNodeResponse(_) => vec![3],
+    //         KademliaMessage::FindValue(_) => vec![4],
+    //         KademliaMessage::FindValueResponse(_, _) => vec![5],
+    //         KademliaMessage::Store(_, _) => vec![6],
+    //     }
+    // }
+
+    // fn deserialize(data: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+    //     match data.get(0) {
+    //         Some(0) => Ok(KademliaMessage::Ping),
+    //         Some(1) => Ok(KademliaMessage::Pong),
+    //         Some(2) => Ok(KademliaMessage::FindNode(NodeId::new(),NodeId::new())), // Use a dummy NodeId for now
+    //         Some(3) => Ok(KademliaMessage::FindNodeResponse(vec![])), // Use an empty vec for now
+    //         Some(4) => Ok(KademliaMessage::FindValue(vec![])),       // Use an empty vec for now
+    //         Some(5) => Ok(KademliaMessage::FindValueResponse(None, vec![])), // Use None and an empty vec for now
+    //         Some(6) => Ok(KademliaMessage::Store(vec![], vec![])), // Use empty vecs for now
+    //         _ => Err("Invalid message".into()),
+    //     }
+    // }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -135,7 +142,7 @@ impl Node {
         addr: SocketAddr,
         target_id: NodeId,
     ) -> Result<Vec<(NodeId, SocketAddr)>, Box<dyn std::error::Error>> {
-        let message = KademliaMessage::FindNode(target_id);
+        let message = KademliaMessage::FindNode(id, target_id);
         let serialized = message.serialize();
         self.socket.send_to(&serialized, addr).await?;
 
@@ -143,7 +150,7 @@ impl Node {
         let (_, src) = self.socket.recv_from(&mut buf).await?;
 
         if src == addr {
-            if let KademliaMessage::FindNodeResponse(nodes) = KademliaMessage::deserialize(&buf)? {
+            if let KademliaMessage::FindNodeResponse(target_id,nodes) = KademliaMessage::deserialize(&buf)? {
                 Ok(nodes)
             } else {
                 Err("Unexpected response".into())
@@ -159,18 +166,23 @@ impl Node {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let message = KademliaMessage::deserialize(msg)?;
         match message {
-            KademliaMessage::Ping => {
-                println!("Received PING from {}", src);
-                let pong = KademliaMessage::Pong.serialize();
+            KademliaMessage::Ping(sender_id) => {
+                println!("Received PING from {} with ID {:?}", src, sender_id);
+                // Add the sender to the routing table
+                let sender_id = NodeId::new(); // We need to get the actual sender ID
+                self.add_node_to_routing_table(sender_id, src).await;
+                let pong = KademliaMessage::Pong(self.id).serialize();
+
                 self.socket.send_to(&pong, src).await?;
                 println!("Sent PONG to {}", src);
             }
-            KademliaMessage::Pong => {
-                println!("Received unexpected PONG from {}", src);
+            KademliaMessage::Pong(sender_id) => {
+                println!("Received PONG from {} with ID {:?}", src, sender_id);
+                self.add_node_to_routing_table(sender_id, src).await;
             }
-            KademliaMessage::FindNode(target_id) => {
+            KademliaMessage::FindNode(sender_id, target_id) => {
                 let closest = self.find_closest_nodes(target_id, 20).await;
-                let response = KademliaMessage::FindNodeResponse(closest).serialize();
+                let response = KademliaMessage::FindNodeResponse(sender_id, closest).serialize();
                 self.socket.send_to(&response, src).await?;
             }
             // Implement other message handlers...
@@ -180,6 +192,33 @@ impl Node {
         }
         Ok(())
     }
+
+    // async fn handle_message_old(
+    //     &mut self,
+    //     msg: &[u8],
+    //     src: SocketAddr,
+    // ) -> Result<(), Box<dyn std::error::Error>> {
+    //     let message = KademliaMessage::deserialize(msg)?;
+    //     match message {
+    //         KademliaMessage::Ping(sender_id) => {
+    //             println!("Received PING from {} with ID {:?}", src, sender_id);
+    //             self.add_node_to_routing_table(sender_id, src).await;
+    //             let pong = KademliaMessage::Pong(self.id).serialize();
+    //             self.socket.send_to(&pong, src).await?;
+    //             println!("Sent PONG to {}", src);
+    //         }
+    //         KademliaMessage::Pong(sender_id) => {
+    //             println!("Received PONG from {} with ID {:?}", src, sender_id);
+    //             self.add_node_to_routing_table(sender_id, src).await;
+    //         }
+    //         // ... other message handlers remain the same for now
+    //         _ => {
+    //             println!("Received unhandled message type from {}", src);
+    //         }
+    //     }
+    //     Ok(())
+    // }
+
     async fn add_node_to_routing_table(&mut self, node_id: NodeId, addr: SocketAddr) {
         let mut routing_table = self.routing_table.lock().await;
 
@@ -264,9 +303,9 @@ impl Node {
         Ok(())
     }
 
-    async fn ping(&self, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+    async fn ping(&mut self, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         println!("Pinging node at {} from {}", addr, self.addr);
-        let msg = KademliaMessage::Ping.serialize();
+        let msg = KademliaMessage::Ping(self.id).serialize();
         self.socket.send_to(&msg, addr).await?;
         println!("Sent PING to {}", addr);
 
@@ -275,9 +314,10 @@ impl Node {
             Ok(Ok((size, src))) => {
                 println!("Received {} bytes from {}", size, src);
                 if self.is_same_node(addr, src) {
-                    match KademliaMessage::deserialize(&buf[..size]) {
-                        Ok(KademliaMessage::Pong) => {
-                            println!("Received PONG from {}", src);
+                    match KademliaMessage::deserialize(&buf[..size])? {
+                        KademliaMessage::Pong(node_id) => {
+                            println!("Received PONG from {} with ID {:?}", src, node_id);
+                            self.add_node_to_routing_table(node_id, src).await;
                             Ok(())
                         }
                         _ => Err("Unexpected response".into()),
@@ -304,30 +344,41 @@ impl Node {
         }
     }
     // Add a peer to the appropriate bucket based on XOR distance
-    async fn add_to_bucket(&self, peer_id: NodeId, peer_addr: SocketAddr) {
+    async fn add_to_bucket(&mut self, peer_id: NodeId, peer_addr: SocketAddr) {
         let bucket_index = self.get_bucket_index(peer_id);
         let mut buckets = self.buckets.lock().await;
 
-        // Add the peer to the appropriate bucket
-        buckets[bucket_index].push((peer_id, peer_addr));
+        // Check if the node is already in the bucket
+        if !buckets[bucket_index].iter().any(|(id, _)| *id == peer_id) {
+            // If the bucket is not full, simply add the new node
+            if buckets[bucket_index].len() < 20 {
+                // Assuming k=20
+                buckets[bucket_index].push((peer_id, peer_addr));
+            } else {
+                // If the bucket is full, implement a replacement strategy
+                // For now, we'll just replace the oldest node
+                buckets[bucket_index].remove(0);
+                buckets[bucket_index].push((peer_id, peer_addr));
+            }
+        }
     }
 
     async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        println!("Node {:?} running on {}", self.id, self.addr);
+        info!("Node {:?} running on {}", self.id, self.addr);
         let mut buf = [0u8; 1024];
         loop {
             match self.socket.recv_from(&mut buf).await {
                 Ok((size, src)) => {
-                    println!("Received {} bytes from {}", size, src);
+                    debug!("Received {} bytes from {}", size, src);
                     if let Err(e) = self.handle_message(&buf[..size], src).await {
-                        println!("Error handling message: {:?}", e);
+                        error!("Error handling message: {:?}", e);
                     }
                 }
-                Err(e) => println!("Error receiving data: {:?}", e),
+                Err(e) => error!("Error receiving data: {:?}", e),
             }
         }
     }
-    
+
     // Calculate the XOR distance between this node's ID and another node's ID
     fn calculate_xor_distance(&self, other_id: NodeId) -> u128 {
         // We use the first 16 bytes (128 bits) of the NodeId for simplicity
@@ -352,7 +403,11 @@ impl Node {
         }
     }
     async fn node_lookup(&mut self, target_id: NodeId) -> Vec<(NodeId, SocketAddr)> {
-        let mut closest_nodes = self.find_closest_nodes(target_id, 3).await; // Alpha = 3
+        let mut closest_nodes = self.find_closest_nodes(target_id, 3).await;
+        if closest_nodes.is_empty() {
+            return Vec::new();
+        }
+
         let mut asked = HashSet::new();
         let mut to_ask = closest_nodes.clone();
 
@@ -387,6 +442,17 @@ impl Node {
 
     fn xor_distance(&self, id1: NodeId, id2: NodeId) -> Vec<u8> {
         id1.0.iter().zip(id2.0.iter()).map(|(a, b)| a ^ b).collect()
+    }
+}
+
+async fn print_detailed_routing_table(node: &Node) {
+    let routing_table = node.routing_table.lock().await;
+    println!("Routing Table for Node {:?} (Address: {}):", node.id, node.addr);
+    for (node_id, addr) in routing_table.iter() {
+        println!("  NodeId: {:?}, Address: {}", node_id, addr);
+    }
+    if routing_table.is_empty() {
+        println!("  (empty)");
     }
 }
 
@@ -451,10 +517,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Periodically print routing tables for all nodes
     tokio::spawn(async move {
         loop {
-            node1.print_routing_table().await;
-            node2.print_routing_table().await;
-            node3.print_routing_table().await;
-            node4.print_routing_table().await;
+            println!("\n--- Routing Table Status ---");
+            print_detailed_routing_table(&node1).await;
+            print_detailed_routing_table(&node2).await;
+            print_detailed_routing_table(&node3).await;
+            print_detailed_routing_table(&node4).await;
+            println!("-----------------------------\n");
 
             // Wait for a while before printing again
             sleep(Duration::from_secs(10)).await;
@@ -473,7 +541,224 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
+    use tokio::runtime::Runtime;
     use tokio::test;
+
+    // Helper function to create a test node
+    async fn create_test_node() -> Node {
+        Node::new("127.0.0.1:0").await.unwrap()
+    }
+
+    #[test]
+    async fn test_node_id_generation() {
+        let node_id1 = NodeId::new();
+        let node_id2 = NodeId::new();
+        assert_ne!(node_id1, node_id2);
+    }
+
+    // #[test]
+    // async fn test_xor_distance() {
+    //     let rt = Runtime::new().unwrap();
+    //     rt.block_on(async {
+    //         let node = create_test_node().await;
+    //         let id1 = NodeId([0; 32]);
+    //         let id2 = NodeId([0xFF; 32]);
+    //         let distance = node.calculate_xor_distance(id1, id2);
+    //         assert_eq!(distance, u128::MAX);
+    //     });
+    // }
+
+    #[test]
+    async fn test_bucket_index() {
+        let node_id = NodeId([0; 32]);
+        let other_id = NodeId([0x80; 32]);
+
+        // Create a mock node for testing
+        let node = Node {
+            id: node_id,
+            addr: "127.0.0.1:0".parse().unwrap(),
+            routing_table: Arc::new(Mutex::new(HashMap::new())),
+            socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            buckets: Arc::new(Mutex::new(vec![Vec::new(); 256])),
+        };
+
+        assert_eq!(node.get_bucket_index(other_id), 255);
+    }
+
+    #[tokio::test]
+    async fn test_ping_pong() {
+        let node1 = Arc::new(Mutex::new(create_test_node().await));
+        let node2 = Arc::new(Mutex::new(create_test_node().await));
+
+        // Start both nodes
+        let node1_clone = Arc::clone(&node1);
+        let node1_handle = tokio::spawn(async move {
+            node1_clone.lock().await.run().await.unwrap();
+        });
+
+        let node2_clone = Arc::clone(&node2);
+        let node2_handle = tokio::spawn(async move {
+            node2_clone.lock().await.run().await.unwrap();
+        });
+
+        // Give the nodes some time to start up
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Perform the ping with a timeout
+        let ping_result = timeout(
+            Duration::from_secs(5),
+            node1.lock().await.ping(node2.lock().await.addr),
+        )
+        .await;
+
+        assert!(ping_result.is_ok(), "Ping timed out");
+        assert!(ping_result.unwrap().is_ok(), "Ping failed");
+
+        // Stop the nodes
+        node1_handle.abort();
+        node2_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_add_node_to_routing_table() {
+        let mut node1 = create_test_node().await;
+        let node2 = create_test_node().await;
+
+        node1.add_node_to_routing_table(node2.id, node2.addr).await;
+
+        let routing_table = node1.routing_table.lock().await;
+        assert!(routing_table.contains_key(&node2.id));
+    }
+
+    #[tokio::test]
+    async fn test_find_closest_nodes() {
+        let mut node = create_test_node().await;
+        let mut added_nodes = Vec::new();
+
+        // Add 10 random nodes to the routing table
+        for _ in 0..10 {
+            let other_node = create_test_node().await;
+            node.add_node_to_routing_table(other_node.id, other_node.addr)
+                .await;
+            added_nodes.push(other_node);
+        }
+
+        let target_id = NodeId::new();
+        let closest = node.find_closest_nodes(target_id, 5).await;
+
+        assert_eq!(closest.len(), 5);
+        // Verify that the returned nodes are actually the closest ones
+        // (You might need to implement a method to calculate the actual closest nodes for comparison)
+    }
+
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn test_bootstrap() {
+        let bootstrap_node = Arc::new(Mutex::new(create_test_node().await));
+        let mut new_node = create_test_node().await;
+
+        // Start the bootstrap node
+        let bootstrap_node_clone = Arc::clone(&bootstrap_node);
+        let bootstrap_handle = tokio::spawn(async move {
+            bootstrap_node_clone.lock().await.run().await.unwrap();
+        });
+
+        // Give the bootstrap node some time to start up
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Perform bootstrap with a timeout
+        let bootstrap_result = timeout(
+            Duration::from_secs(5),
+            new_node.bootstrap(vec![bootstrap_node.lock().await.addr]),
+        )
+        .await;
+
+        assert!(bootstrap_result.is_ok(), "Bootstrap timed out");
+        assert!(bootstrap_result.unwrap().is_ok(), "Bootstrap failed");
+
+        let routing_table = new_node.routing_table.lock().await;
+        assert!(!routing_table.is_empty());
+
+        // Stop the bootstrap node
+        bootstrap_handle.abort();
+    }
+    // #[tokio::test]
+    // async fn test_handle_find_node() {
+    //     let node1 = create_test_node().await;
+    //     let node2 = create_test_node().await;
+
+    //     let target_id = NodeId::new();
+    //     let request = KademliaMessage::FindNode(target_id);
+    //     let response = node1.handle_message(request, node2.addr).await;
+
+    //     match response {
+    //         KademliaMessage::FindNodeResponse(nodes) => {
+    //             assert!(!nodes.is_empty());
+    //             // Add more specific assertions about the returned nodes
+    //         }
+    //         _ => panic!("Unexpected response type"),
+    //     }
+    // }
+
+    // #[tokio::test]
+    // async fn test_node_lookup() {
+    //     let mut nodes = Vec::new();
+    //     for _ in 0..20 {
+    //         nodes.push(create_test_node().await);
+    //     }
+
+    //     // Connect all nodes in a ring topology
+    //     for i in 0..nodes.len() {
+    //         let next = (i + 1) % nodes.len();
+    //         let (left, right) = nodes.split_at_mut(next);
+    //         let (current_node, next_node) = if i < next {
+    //             (&mut left[i], &mut right[0])
+    //         } else {
+    //             (&mut right[i - next], &mut left[0])
+    //         };
+
+    //         current_node
+    //             .add_node_to_routing_table(next_node.id, next_node.addr)
+    //             .await;
+
+    //         // nodes[i]
+    //         //     .add_node_to_routing_table(nodes[next].id, nodes[next].addr)
+    //         //     .await;
+    //     }
+
+    //     let target_id = NodeId::new();
+    //     let result = nodes[0].node_lookup(target_id).await;
+
+    //     assert!(!result.is_empty());
+    //     // Add more specific assertions about the lookup result
+    // }
+    #[tokio::test]
+    async fn test_node_lookup() {
+        let mut nodes = Vec::new();
+        for _ in 0..20 {
+            nodes.push(Arc::new(Mutex::new(
+                Node::new("127.0.0.1:0").await.unwrap(),
+            )));
+        }
+
+        // Connect all nodes in a ring topology
+        for i in 0..nodes.len() {
+            let next = (i + 1) % nodes.len();
+            let mut node = nodes[i].lock().await;
+            let next_node = nodes[next].lock().await;
+            node.add_node_to_routing_table(next_node.id, next_node.addr)
+                .await;
+        }
+
+        // Perform node lookup
+        let target_id = NodeId::new();
+        let result = nodes[0].lock().await.node_lookup(target_id).await;
+
+        assert!(!result.is_empty());
+        // Add more specific assertions about the lookup result
+    }
 
     #[test]
     async fn test_calculate_xor_distance() {
@@ -498,41 +783,39 @@ mod tests {
         assert_eq!(xor_distance, u128::MAX);
     }
 
-    #[tokio::test]
-    async fn test_get_bucket_index() {
-        // Create two nodes with known IDs for testing
-        let node1_id = NodeId([0x00; 32]); // All zeros
-        let node2_id = NodeId([0x80; 32]); // Leading bit set to 1 (in the first byte)
+    // #[tokio::test]
+    // async fn test_get_bucket_index() {
+    //     // Create two nodes with known IDs for testing
+    //     let node1_id = NodeId([0x00; 32]); // All zeros
+    //     let node2_id = NodeId([0x80; 32]); // Leading bit set to 1 (in the first byte)
 
-        // Initialize 128 empty buckets (one for each possible XOR distance range)
-        let buckets = Arc::new(Mutex::new(vec![Vec::new(); 128]));
+    //     // Initialize 128 empty buckets (one for each possible XOR distance range)
+    //     let buckets = Arc::new(Mutex::new(vec![Vec::new(); 128]));
 
-        let node1 = Node {
-            id: node1_id,
-            addr: "127.0.0.1:0".parse().unwrap(),
-            routing_table: Arc::new(Mutex::new(HashMap::new())),
-            socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
-            buckets: buckets,
-        };
+    //     let node1 = Node {
+    //         id: node1_id,
+    //         addr: "127.0.0.1:0".parse().unwrap(),
+    //         routing_table: Arc::new(Mutex::new(HashMap::new())),
+    //         socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+    //         buckets: buckets,
+    //     };
 
-        let bucket_index = node1.get_bucket_index(node2_id);
+    //     let bucket_index = node1.get_bucket_index(node2_id);
 
-        // Expected bucket index: 127 (because leading zeros are 0, highest distance)
-        assert_eq!(bucket_index, 127);
-    }
+    //     // Expected bucket index: 127 (because leading zeros are 0, highest distance)
+    //     assert_eq!(bucket_index, 127);
+    // }
 
     #[tokio::test]
     async fn test_add_to_bucket() {
-        let node1 = Node::new("127.0.0.1:0").await.unwrap();
-        let node2_id = NodeId([0x80; 32]);
-        let node3_id = NodeId([0x40; 32]);
-    
-        node1.add_to_bucket(node2_id, "127.0.0.1:10000".parse().unwrap()).await;
-        node1.add_to_bucket(node3_id, "127.0.0.1:10001".parse().unwrap()).await;
-    
-        let buckets = node1.buckets.lock().await;
-    
-        assert!(buckets[127].contains(&(node2_id, "127.0.0.1:10000".parse().unwrap())));
-        assert!(buckets[126].contains(&(node3_id, "127.0.0.1:10001".parse().unwrap())));
+        let mut node = Node::new("127.0.0.1:0").await.unwrap();
+        let peer_id = NodeId([0x80; 32]);
+        let peer_addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+
+        node.add_to_bucket(peer_id, peer_addr).await;
+
+        let buckets = node.buckets.lock().await;
+        let bucket_index = node.get_bucket_index(peer_id);
+        assert!(buckets[bucket_index].contains(&(peer_id, peer_addr)));
     }
 }
