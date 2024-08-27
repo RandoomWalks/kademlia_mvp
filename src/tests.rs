@@ -5,6 +5,9 @@ use std::net::{IpAddr, Ipv4Addr};
 use tokio::sync::Mutex;
 // use toxiproxy_rust::Toxiproxy;
 use toxiproxy_rust::{TOXIPROXY, proxy::ProxyPack};
+use crate::node::NodeId;
+use crate::message::KademliaMessage;
+use crate::routing::{KBucket, RoutingTable};
 
 
 async fn create_node(port: u16) -> Node {
@@ -143,7 +146,6 @@ fn test_routing_table_find_closest_nodes() {
         .expect_find_closest_nodes()
         .with(eq(target), eq(count))
         .times(1)
-        
         .returning(move |_, _| expected_result_clone.clone());
 
     let result = mock_routing_table.find_closest_nodes(&target, count);
@@ -229,12 +231,12 @@ fn test_k_bucket_add_node() {
 
 #[test]
 fn test_node_id_distance() {
-    let id1 = NodeId([0; 32]);
-    let id2 = NodeId([255; 32]);
+    let id1 = NodeId::new_val([0; 32]);
+    let id2 = NodeId::new_val([255; 32]);
     let distance = id1.distance(&id2);
     assert_eq!(distance, [255; 32]);
 
-    let id3 = NodeId([1; 32]);
+    let id3 = NodeId::new_val([1; 32]);
     let distance = id1.distance(&id3);
     assert_eq!(distance, [1; 32]);
 }
