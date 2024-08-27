@@ -5,12 +5,14 @@ use crate::message::{FindValueResult, Message};
 use crate::routing_table::RoutingTable;
 use crate::utils::{KademliaError, NodeId};
 
+use crate::utils::{Config, ALPHA, BOOTSTRAP_NODES, K};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -19,13 +21,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio::time::{interval, Duration};
-// use crate::interfaces::{NetworkInterface,TimeProvider, Delay};
-
-use crate::utils::{Config, ALPHA, BOOTSTRAP_NODES, K};
-
-use bincode::{deserialize, serialize};
 
 use async_trait::async_trait;
+use bincode::{deserialize, serialize};
 
 // Network Manager
 pub struct NetworkManager {
@@ -43,6 +41,7 @@ impl NetworkManager {
         message: &Message,
         dst: SocketAddr,
     ) -> Result<(), KademliaError> {
+        debug!("Sending message to {}: {:?}", dst, message);
         let serialized = bincode::serialize(message)?;
         self.socket.send_to(&serialized, dst).await?;
         Ok(())
@@ -52,6 +51,7 @@ impl NetworkManager {
         let mut buf = vec![0u8; 1024];
         let (size, src) = self.socket.recv_from(&mut buf).await?;
         let message: Message = bincode::deserialize(&buf[..size])?;
+        debug!("Received message from {}: {:?}", src, message);
         Ok((message, src))
     }
 }
@@ -137,15 +137,17 @@ impl fmt::Debug for KademliaNode {
 
 impl KademliaNode {
     pub async fn new(
-        socket: Arc<UdpSocket>,
         config: Option<Config>,
         bootstrap_nodes: Vec<SocketAddr>,
     ) -> Result<(Self, mpsc::Sender<()>), KademliaError> {
+        let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
         let addr = socket.local_addr()?;
         let id = NodeId::new();
         let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
 
         let config = Arc::new(config.unwrap_or_default());
+
+        info!("KademliaNode bound to address: {}", addr);
 
         Ok((
             KademliaNode {
@@ -162,6 +164,99 @@ impl KademliaNode {
         ))
     }
 
+    fn is_same_node(&self, addr1: SocketAddr, addr2: SocketAddr) -> bool {
+        if addr1 == addr2 {
+            return true;
+        }
+        match (addr1.ip(), addr2.ip()) {
+            (IpAddr::V4(ip1), IpAddr::V4(ip2)) => {
+                (ip1.is_unspecified() || ip2.is_unspecified() || ip1 == ip2)
+                    && addr1.port() == addr2.port()
+            }
+            _ => false,
+        }
+    }
+
+    // pub async fn bootstrap(&mut self) -> Result<(), KademliaError> {
+    //     info!("Node {:?} starting bootstrap process", self.id);
+
+    //     let mut successful_contacts = Vec::new();
+
+    //     for &bootstrap_addr in &self.bootstrap_nodes {
+    //         for attempt in 1..=3 {
+    //             match self.ping(bootstrap_addr).await {
+    //                 Ok(_) => {
+    //                     info!("Successfully pinged bootstrap node at {}", bootstrap_addr);
+    //                     successful_contacts.push(bootstrap_addr);
+    //                     break; // Break out of the retry loop on success
+    //                 }
+    //                 Err(e) => {
+    //                     warn!(
+    //                         "Failed to ping bootstrap node at {}: {:?}. Attempt {}/3",
+    //                         bootstrap_addr, e, attempt
+    //                     );
+    //                     if attempt < 3 {
+    //                         sleep(Duration::from_secs(1)).await;
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     }
+
+    //     if successful_contacts.is_empty() {
+    //         warn!("No bootstrap nodes responded. Marking this node as the first in the network.");
+    //         self.routing_table.update(self.id, self.addr); // Manually add itself to the routing table
+    //         debug!(
+    //             "Updated routing table with node {:?} at address {}",
+    //             self.id, self.addr
+    //         );
+    //         return Ok(()); // Exit the bootstrap process as this node is now the first node
+    //     }
+
+    //     for &contact in &successful_contacts {
+    //         match self.find_node(self.id).await {
+    //             Ok(nodes) => {
+    //                 info!(
+    //                     "Found {} nodes from bootstrap node {}",
+    //                     nodes.len(),
+    //                     contact
+    //                 );
+    //                 for (node_id, addr) in nodes {
+    //                     self.routing_table.update(node_id, addr);
+    //                     debug!(
+    //                         "Updated routing table with node {:?} at address {}",
+    //                         node_id, addr
+    //                     );
+
+    //                     if self.ping(addr).await.is_ok() {
+    //                         info!(
+    //                             "Successfully pinged and added node {:?} at {} to routing table",
+    //                             node_id, addr
+    //                         );
+    //                     }
+    //                 }
+    //             }
+    //             Err(e) => {
+    //                 warn!(
+    //                     "Failed to find nodes from bootstrap node {}: {:?}",
+    //                     contact, e
+    //                 );
+    //             }
+    //         }
+    //     }
+
+    //     let table_size = self.get_routing_table_size();
+    //     info!(
+    //         "Bootstrap process completed for node {:?}. Routing table size: {}",
+    //         self.id, table_size
+    //     );
+
+    //     if table_size == 0 {
+    //         warn!("Routing table is empty after bootstrap. This might be the first node in the network.");
+    //     }
+
+    //     Ok(())
+    // }
     pub async fn bootstrap(&mut self) -> Result<(), KademliaError> {
         info!("Node {:?} starting bootstrap process", self.id);
 
@@ -177,18 +272,17 @@ impl KademliaNode {
                     }
                     Err(e) => {
                         warn!(
-                            "Failed to ping bootstrap node at {}: {:?}. Retrying in {}ms...",
-                            bootstrap_addr,
-                            e,
-                            attempt * 500
+                            "Failed to ping bootstrap node at {}: {:?}. Attempt {}/3",
+                            bootstrap_addr, e, attempt
                         );
-                        sleep(Duration::from_millis(attempt * 500)).await; // Exponential backoff
+                        if attempt < 3 {
+                            sleep(Duration::from_secs(1)).await;
+                        }
                     }
                 }
             }
         }
 
-        // After pinging all bootstrap nodes
         if successful_contacts.is_empty() {
             warn!("No bootstrap nodes responded. Marking this node as the first in the network.");
             self.routing_table.update(self.id, self.addr); // Manually add itself to the routing table
@@ -222,6 +316,16 @@ impl KademliaNode {
                             );
                         }
                     }
+
+                    // Ensure that the contact node is added to the routing table if not already present
+                    if !self
+                        .routing_table
+                        .find_closest(&self.id, 1)
+                        .iter()
+                        .any(|(_, addr)| *addr == contact)
+                    {
+                        self.routing_table.update(self.id, contact);
+                    }
                 }
                 Err(e) => {
                     warn!(
@@ -253,6 +357,7 @@ impl KademliaNode {
                 result = self.network_manager.receive_message() => {
                     match result {
                         Ok((message, src)) => {
+                            debug!("Received message from {}: {:?}", src, message);
                             match message {
                                 Message::ClientStore { .. } | Message::ClientGet { .. } => {
                                     self.handle_client_message(message, src).await?;
@@ -332,7 +437,10 @@ impl KademliaNode {
         self.storage_manager.store(&key, &value).await?;
 
         self.routing_table.update(sender, src);
-        debug!("handle_store:: Updated routing table with node {:?} at address {}", sender,src);
+        debug!(
+            "handle_store:: Updated routing table with node {:?} at address {}",
+            sender, src
+        );
 
         self.network_manager
             .send_message(
@@ -351,9 +459,12 @@ impl KademliaNode {
         src: SocketAddr,
     ) -> Result<(), KademliaError> {
         let closest_nodes = self.routing_table.find_closest(&target, self.config.k);
+        debug!(
+            "handle_find_node:: Found closest nodes for target {:?}: {:?}",
+            target, closest_nodes
+        );
 
         let response = Message::NodesFound(closest_nodes);
-
         self.network_manager.send_message(&response, src).await
     }
 
@@ -362,13 +473,19 @@ impl KademliaNode {
         key: Vec<u8>,
         src: SocketAddr,
     ) -> Result<(), KademliaError> {
+        debug!("Handling FIND_VALUE for key: {:?}", key);
         match self.find_value(&key).await {
             FindValueResult::Value(value) => {
+                debug!("Value found locally for key: {:?}", key);
                 self.network_manager
                     .send_message(&Message::ValueFound(value), src)
                     .await
             }
             FindValueResult::Nodes(nodes) => {
+                debug!(
+                    "Value not found locally. Responding with closest nodes for key: {:?}",
+                    key
+                );
                 self.network_manager
                     .send_message(&Message::NodesFound(nodes), src)
                     .await
@@ -439,7 +556,6 @@ impl KademliaNode {
     }
 
     pub async fn replicate_store(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), KademliaError> {
-        //  let nodeID = match &key[..].try_into()
         let node_id = NodeId::from_slice(key.as_slice().try_into().unwrap());
         debug!(
             "Finding closest nodes for replication, target: {:?}",
@@ -464,6 +580,10 @@ impl KademliaNode {
         error_message: Option<String>,
         dst: SocketAddr,
     ) -> Result<(), KademliaError> {
+        debug!(
+            "Sending client store response: success={}, error_message={:?}",
+            success, error_message
+        );
         let response = Message::ClientStoreResponse {
             success,
             error_message,
@@ -477,6 +597,10 @@ impl KademliaNode {
         error_message: Option<String>,
         dst: SocketAddr,
     ) -> Result<(), KademliaError> {
+        debug!(
+            "Sending client get response: value={:?}, error_message={:?}",
+            value, error_message
+        );
         let response = Message::ClientGetResponse {
             value,
             error_message,
@@ -502,12 +626,13 @@ impl KademliaNode {
     }
 
     pub async fn find_value(&self, key: &[u8]) -> FindValueResult {
-        // First, check local storage
+        debug!("Searching for value associated with key: {:?}", key);
+
         if let Some(value) = self.storage_manager.get(key).await {
+            debug!("Value found locally for key: {:?}", key);
             return FindValueResult::Value(value);
         }
 
-        // If not found locally, perform a network lookup
         let target = NodeId::from_slice(&StorageManager::hash_key(key)[..32].try_into().unwrap());
         let mut closest_nodes = self.routing_table.find_closest(&target, self.config.k);
         let mut queried_nodes = HashSet::new();
@@ -520,9 +645,17 @@ impl KademliaNode {
                     continue;
                 }
 
+                debug!(
+                    "Querying node {:?} at address {:?} for value",
+                    node_id, addr
+                );
                 match self.send_find_value_message(key, *addr).await {
-                    Ok(Message::ValueFound(value)) => return FindValueResult::Value(value),
+                    Ok(Message::ValueFound(value)) => {
+                        debug!("Value found on node {:?}: {:?}", node_id, value);
+                        return FindValueResult::Value(value);
+                    }
                     Ok(Message::NodesFound(nodes)) => {
+                        debug!("Received closer nodes: {:?}", nodes);
                         new_queries.extend(nodes);
                     }
                     _ => {} // Handle other cases or errors
@@ -531,18 +664,16 @@ impl KademliaNode {
                 queried_nodes.insert(*node_id);
             }
 
-            // Update closest nodes
             closest_nodes.extend(new_queries);
             closest_nodes.sort_by(|a, b| target.distance(&a.0).cmp(&target.distance(&b.0)));
             closest_nodes.truncate(self.config.k);
 
-            // Break if we've queried enough nodes
             if queried_nodes.len() >= self.config.k {
                 break;
             }
         }
 
-        // If value not found, return the closest nodes
+        debug!("Returning closest nodes for key: {:?}", key);
         FindValueResult::Nodes(closest_nodes)
     }
 
@@ -552,6 +683,7 @@ impl KademliaNode {
         addr: SocketAddr,
     ) -> Result<Message, KademliaError> {
         let message = Message::FindValue { key: key.to_vec() };
+        debug!("Sending FIND_VALUE message to {}: {:?}", addr, key);
         self.network_manager.send_message(&message, addr).await?;
 
         match tokio::time::timeout(
@@ -560,14 +692,23 @@ impl KademliaNode {
         )
         .await
         {
-            Ok(Ok((response, _))) => Ok(response),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(KademliaError::Timeout),
+            Ok(Ok((response, _))) => {
+                debug!("Received response from {}: {:?}", addr, response);
+                Ok(response)
+            }
+            Ok(Err(e)) => {
+                error!("Error receiving response from {}: {:?}", addr, e);
+                Err(e)
+            }
+            Err(_) => {
+                warn!("Timeout waiting for response from {}", addr);
+                Err(KademliaError::Timeout)
+            }
         }
     }
 
     pub async fn ping(&self, addr: SocketAddr) -> Result<(), KademliaError> {
-        debug!("Pinging node at {}", addr);
+        debug!("Pinging node at {} from {}", addr, self.addr);
         self.network_manager
             .send_message(&Message::Ping { sender: self.id }, addr)
             .await?;
@@ -578,13 +719,21 @@ impl KademliaNode {
         )
         .await
         {
-            Ok(Ok((Message::Pong { sender }, _))) => {
-                debug!("Received pong from {:?} at {}", sender, addr);
-                Ok(())
+            Ok(Ok((Message::Pong { sender }, src))) => {
+                if self.is_same_node(addr, src) {
+                    debug!("Received pong from {:?} at {}", sender, src);
+                    Ok(())
+                } else {
+                    error!("Unexpected response from {}", src);
+                    Err(KademliaError::UnexpectedResponse)
+                }
             }
             Ok(Ok(_)) => Err(KademliaError::UnexpectedResponse),
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(KademliaError::Timeout),
+            Err(_) => {
+                warn!("Timeout waiting for pong from {}", addr);
+                Err(KademliaError::Timeout)
+            }
         }
     }
 
@@ -632,7 +781,9 @@ impl KademliaNode {
     }
 
     pub async fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, KademliaError> {
+        debug!("Attempting to retrieve key: {:?}", key);
         if let Some(value) = self.storage_manager.get(key).await {
+            debug!("Found value locally for key: {:?}", key);
             return Ok(Some(value));
         }
 
@@ -641,6 +792,7 @@ impl KademliaNode {
         let nodes = self.find_node(target).await?;
 
         for (_, addr) in nodes.iter().take(self.config.alpha) {
+            debug!("Sending FIND_VALUE request to node at {:?}", addr);
             self.network_manager
                 .send_message(&Message::FindValue { key: key.to_vec() }, *addr)
                 .await?;
@@ -652,20 +804,30 @@ impl KademliaNode {
             .await
             {
                 Ok(Ok((Message::ValueFound(value), _))) => {
+                    debug!("Value found at node {:?}: {:?}", addr, value);
                     self.storage_manager.store(key, &value).await?;
                     return Ok(Some(value));
                 }
-                Ok(Ok((Message::NodesFound(_), _))) => continue,
-                Ok(Err(e)) => warn!("Error receiving message: {:?}", e),
-                Err(_) => warn!("Timeout waiting for response from {}", addr),
+                Ok(Ok((Message::NodesFound(_), _))) => {
+                    debug!("Received NodesFound response from {:?}", addr);
+                    continue;
+                }
+                Ok(Err(e)) => {
+                    warn!("Error receiving message from {}: {:?}", addr, e);
+                }
+                Err(_) => {
+                    warn!("Timeout waiting for response from {}", addr);
+                }
                 _ => warn!("Unexpected message received from {}", addr),
             }
         }
 
+        warn!("Failed to find value for key: {:?}", key);
         Ok(None)
     }
 
     pub async fn refresh_buckets(&mut self) -> Result<(), KademliaError> {
+        debug!("Refreshing routing table buckets");
         for bucket in &self.routing_table.buckets {
             if let Some(node) = bucket.entries.first() {
                 if let Err(e) = self.ping(node.addr).await {
@@ -682,6 +844,7 @@ impl KademliaNode {
         &self,
         target: NodeId,
     ) -> Result<Vec<(NodeId, SocketAddr)>, KademliaError> {
+        debug!("Searching for closest nodes to target: {:?}", target);
         let mut closest_nodes = self.routing_table.find_closest(&target, self.config.k);
         let mut queried_nodes = HashSet::new();
         let mut pending_queries = HashSet::new();
@@ -740,6 +903,10 @@ impl KademliaNode {
             }
         }
 
+        debug!(
+            "Found closest nodes for target {:?}: {:?}",
+            target, closest_nodes
+        );
         Ok(closest_nodes)
     }
 
@@ -749,6 +916,10 @@ impl KademliaNode {
         addr: SocketAddr,
         target: NodeId,
     ) -> Result<Vec<(NodeId, SocketAddr)>, KademliaError> {
+        debug!(
+            "Sending FIND_NODE request to node {:?} at {:?}",
+            node_id, addr
+        );
         self.network_manager
             .send_message(&Message::FindNode { target }, addr)
             .await?;
@@ -759,10 +930,19 @@ impl KademliaNode {
         )
         .await
         {
-            Ok(Ok((Message::NodesFound(nodes), _))) => Ok(nodes),
+            Ok(Ok((Message::NodesFound(nodes), _))) => {
+                debug!("Received nodes from {:?}: {:?}", addr, nodes);
+                Ok(nodes)
+            }
             Ok(Ok(_)) => Err(KademliaError::UnexpectedResponse),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(KademliaError::Timeout),
+            Ok(Err(e)) => {
+                error!("Error receiving response from {:?}: {:?}", addr, e);
+                Err(e)
+            }
+            Err(_) => {
+                warn!("Timeout waiting for response from {}", addr);
+                Err(KademliaError::Timeout)
+            }
         }
     }
 
@@ -778,6 +958,10 @@ impl KademliaNode {
             sender: self.id,
             timestamp: SystemTime::now(),
         };
+        debug!(
+            "Sending STORE message to {} for key: {:?}, value: {:?}",
+            addr, key, value
+        );
         self.network_manager.send_message(&message, addr).await?;
 
         match tokio::time::timeout(
@@ -798,27 +982,46 @@ impl KademliaNode {
                 }
                 Ok(success)
             }
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(KademliaError::Timeout),
-            _ => Err(KademliaError::UnexpectedResponse),
+            Ok(Err(e)) => {
+                error!("Error receiving STORE response from {}: {:?}", addr, e);
+                Err(e)
+            }
+            Err(_) => {
+                warn!("Timeout waiting for STORE response from {}", addr);
+                Err(KademliaError::Timeout)
+            }
+            _ => {
+                error!(
+                    "Unexpected response while waiting for STORE confirmation from {}",
+                    addr
+                );
+                Err(KademliaError::UnexpectedResponse)
+            }
         }
     }
 
     // Methods for state inspection
     pub fn get_routing_table_size(&self) -> usize {
-        self.routing_table
+        let size = self
+            .routing_table
             .buckets
             .iter()
             .map(|bucket| bucket.entries.len())
-            .sum()
+            .sum();
+        debug!("Routing table size: {}", size);
+        size
     }
 
     pub async fn get_storage_size(&self) -> usize {
-        self.storage_manager.storage.len()
+        let size = self.storage_manager.storage.len();
+        debug!("Local storage size: {}", size);
+        size
     }
 
     pub async fn get_cached_entries_count(&self) -> usize {
-        self.storage_manager.cache.cache_store.read().await.len()
+        let count = self.storage_manager.cache.cache_store.read().await.len();
+        debug!("Cache entries count: {}", count);
+        count
     }
 }
 
