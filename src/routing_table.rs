@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::collections::BinaryHeap;
 use std::fmt;
 use std::backtrace::Backtrace;
+use parking_lot::RwLock;
 
 
 /// Struct representing the routing table of a Kademlia DHT node.

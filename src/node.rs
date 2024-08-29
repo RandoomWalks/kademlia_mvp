@@ -27,6 +27,10 @@ use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tokio::time::{interval, Duration};
+use tokio::sync::Semaphore;
+use futures::future::join_all;
+use std::collections::{ BinaryHeap};
+use std::cmp::Reverse;
 
 use async_trait::async_trait;
 use bincode::{deserialize, serialize};
@@ -132,53 +136,38 @@ impl NetworkManager {
 // Storage Manager
 pub struct StorageManager {
     pub storage: Arc<RwLock<DashMap<Vec<u8>, Vec<u8>>>>,
-    pub cache: cache_impl::Cache<Vec<u8>, Vec<u8>>,
+    cache: Arc<cache_impl::Cache<Vec<u8>, Vec<u8>>>,
     pub config: Arc<Config>,
 }
 
 impl StorageManager {
     pub fn new(config: Arc<Config>) -> Self {
         StorageManager {
-            storage: Arc::new(RwLock::new(DashMap::new())),
-            cache: cache_impl::Cache::with_policy(policy::EvictionPolicy::LRU, config.cache_size),
-            config,
+            storage: Arc<DashMap<Vec<u8>, (Vec<u8>, Instant)>>, // Include timestamp for expiration
+            cache: Arc<cache_impl::Cache<Vec<u8>, Vec<u8>>>,
+            config: Arc<Config>,
         }
     }
 
     pub async fn store(&self, key: &[u8], value: &[u8]) -> Result<(), KademliaError> {
-        debug!("StorageManager: Attempting to store key: {:?}", key);
-        let hash = Self::hash_key(key);
-        let mut storage = self.storage.write().await;
-        storage.insert(hash.clone(), value.to_vec());
-        self.cache
-            .put(hash.clone(), value.to_vec(), self.config.cache_ttl)
-            .await
-            .map_err(|_| KademliaError::InvalidData("Failed to update cache"))?;
-        debug!("StorageManager: Successfully stored key: {:?}", key);
+        let expiration = Instant::now() + Duration::from_secs(self.config.data_expiration);
+        self.storage.insert(key.to_vec(), (value.to_vec(), expiration));
+        self.cache.put(key.to_vec(), value.to_vec(), self.config.cache_ttl).await?;
         Ok(())
     }
 
     pub async fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        debug!("StorageManager: Attempting to retrieve key: {:?}", key);
-        let hash = Self::hash_key(key);
-        if let Ok(value) = self.cache.get(&hash).await {
-            debug!(
-                "StorageManager: Retrieved value from cache for key: {:?}",
-                key
-            );
+        if let Some(value) = self.cache.get(key).await.ok() {
             return Some(value);
         }
-
-        let storage = self.storage.read().await;
-        if let Some(value) = storage.get(&hash) {
-            debug!(
-                "StorageManager: Retrieved value from storage for key: {:?}",
-                key
-            );
-            return Some(value.clone());
+        if let Some((value, expiration)) = self.storage.get(key) {
+            if Instant::now() < *expiration {
+                self.cache.put(key.to_vec(), value.clone(), self.config.cache_ttl).await.ok();
+                return Some(value.clone());
+            } else {
+                self.storage.remove(key);
+            }
         }
-
-        debug!("StorageManager: No value found for key: {:?}", key);
         None
     }
 
@@ -236,14 +225,14 @@ pub fn calculate_adaptive_jitter(
 
 // Kademlia Node
 pub struct KademliaNode {
-    pub id: NodeId,
-    pub addr: SocketAddr,
-    pub routing_table: RoutingTable,
-    pub network_manager: NetworkManager,
-    pub storage_manager: StorageManager,
-    pub shutdown: mpsc::Receiver<()>,
-    pub config: Arc<Config>,
-    pub bootstrap_nodes: Vec<SocketAddr>,
+    id: NodeId,
+    addr: SocketAddr,
+    routing_table: Arc<RwLock<RoutingTable>>,
+    network_manager: Arc<NetworkManager>,
+    storage_manager: Arc<StorageManager>,
+    shutdown: mpsc::Receiver<()>,
+    config: Arc<Config>,
+    bootstrap_nodes: Vec<SocketAddr>,
 }
 
 impl fmt::Debug for KademliaNode {
@@ -260,7 +249,7 @@ impl KademliaNode {
     pub async fn new(
         config: Option<Config>,
         bootstrap_nodes: Vec<SocketAddr>,
-    ) -> Result<(Self, mpsc::Sender<()>), KademliaError> {
+    ) -> Result<(Arc<Self>, mpsc::Sender<()>), KademliaError> {
         let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
         let addr = socket.local_addr()?;
         let id = NodeId::new();
@@ -268,21 +257,18 @@ impl KademliaNode {
 
         let config = Arc::new(config.unwrap_or_default());
 
-        info!("KademliaNode bound to address: {}", addr);
+        let node = Arc::new(KademliaNode {
+            id: id.clone(),
+            addr,
+            routing_table: Arc::new(RwLock::new(RoutingTable::new(id))),
+            network_manager: Arc::new(NetworkManager::new(socket, config.clone())),
+            storage_manager: Arc::new(StorageManager::new(config.clone())),
+            shutdown: shutdown_receiver,
+            config,
+            bootstrap_nodes,
+        });
 
-        Ok((
-            KademliaNode {
-                id: id.clone(),
-                addr,
-                routing_table: RoutingTable::new(id),
-                network_manager: NetworkManager::new(socket, config.clone()),
-                storage_manager: StorageManager::new(config.clone()),
-                shutdown: shutdown_receiver,
-                config,
-                bootstrap_nodes,
-            },
-            shutdown_sender,
-        ))
+        Ok((node, shutdown_sender))
     }
 
     fn is_same_node(&self, addr1: SocketAddr, addr2: SocketAddr) -> bool {
@@ -479,7 +465,7 @@ impl KademliaNode {
         sender: NodeId,
         src: SocketAddr,
     ) -> Result<(), KademliaError> {
-        self.routing_table.update(sender, src);
+        self.routing_table.write().update(sender, src);
         debug!(
             "handle_ping:: Updated routing table with node {:?} at address {}",
             sender, src
@@ -502,7 +488,7 @@ impl KademliaNode {
         self.validate_key_value(&key, &value)?;
         self.storage_manager.store(&key, &value).await?;
 
-        self.routing_table.update(sender, src);
+        self.routing_table.write().update(sender, src);
         debug!(
             "handle_store:: Updated routing table with node {:?} at address {}",
             sender, src
@@ -526,7 +512,7 @@ impl KademliaNode {
         target: NodeId,
         src: SocketAddr,
     ) -> Result<(), KademliaError> {
-        let closest_nodes = self.routing_table.find_closest(&target, self.config.k);
+        let closest_nodes = self.routing_table.read().find_closest(&target, self.config.k);
         debug!(
             "handle_find_node:: Found closest nodes for target {:?}: {:?}",
             target, closest_nodes
@@ -902,7 +888,8 @@ impl KademliaNode {
 
     pub async fn refresh_buckets(&mut self) -> Result<(), KademliaError> {
         debug!("Refreshing routing table buckets");
-        for bucket in &self.routing_table.buckets {
+        let buckets = self.routing_table.read().buckets.clone();
+        for bucket in buckets {
             if let Some(node) = bucket.entries.first() {
                 if let Err(e) = self.ping(node.addr).await {
                     warn!("Failed to ping node at {}: {:?}", node.addr, e);
@@ -912,64 +899,74 @@ impl KademliaNode {
 
         info!("Buckets refreshed");
         Ok(())
+
     }
 
     pub async fn find_node(
-        &self,
+        self: &Arc<Self>,
         target: NodeId,
     ) -> Result<Vec<(NodeId, SocketAddr)>, KademliaError> {
         debug!("Searching for closest nodes to target: {:?}", target);
-        let mut closest_nodes = self.routing_table.find_closest(&target, self.config.k);
+        
+        let mut closest_nodes = {
+            let routing_table = self.routing_table.read().await;
+            routing_table.find_closest(&target, self.config.k)
+        };
+
         let mut queried_nodes = HashSet::new();
         let mut pending_queries = HashSet::new();
+        let semaphore = Arc::new(Semaphore::new(self.config.alpha));
 
         while !closest_nodes.is_empty() {
-            let mut new_queries = Vec::new();
+            let mut queries = Vec::new();
 
             for (node_id, addr) in closest_nodes.iter() {
                 if queried_nodes.contains(node_id) || pending_queries.contains(node_id) {
                     continue;
                 }
 
-                new_queries.push((*node_id, *addr));
+                let permit = semaphore.clone().acquire_owned().await.unwrap();
                 pending_queries.insert(*node_id);
 
-                if new_queries.len() >= self.config.alpha {
+                let node_clone = self.clone();
+                let target_clone = target.clone();
+                let node_id_clone = *node_id;
+                let addr_clone = *addr;
+
+                queries.push(tokio::spawn(async move {
+                    let _permit = permit;
+                    match node_clone.find_node_rpc(node_id_clone, addr_clone, target_clone).await {
+                        Ok(nodes) => Some((node_id_clone, nodes)),
+                        Err(_) => None,
+                    }
+                }));
+
+                if queries.len() >= self.config.alpha {
                     break;
                 }
             }
 
-            if new_queries.is_empty() {
+            if queries.is_empty() {
                 break;
             }
 
-            let query_results =
-                futures::future::join_all(new_queries.into_iter().map(|(node_id, addr)| {
-                    let target_clone = target.clone();
-                    async move {
-                        match self.find_node_rpc(node_id, addr, target_clone).await {
-                            Ok(nodes) => Some((node_id, nodes)),
-                            Err(_) => None,
-                        }
-                    }
-                }))
-                .await;
+            let results = join_all(queries).await;
 
-            for result in query_results {
-                if let Some((queried_node, nodes)) = result {
+            for result in results {
+                if let Ok(Some((queried_node, nodes))) = result {
                     queried_nodes.insert(queried_node);
                     pending_queries.remove(&queried_node);
 
                     for (node_id, addr) in nodes {
-                        if !queried_nodes.contains(&node_id) && !pending_queries.contains(&node_id)
-                        {
+                        if !queried_nodes.contains(&node_id) && !pending_queries.contains(&node_id) {
                             closest_nodes.push((node_id, addr));
                         }
                     }
                 }
             }
 
-            closest_nodes.sort_by(|a, b| target.distance(&a.0).cmp(&target.distance(&b.0)));
+            // Sort closest_nodes based on XOR distance to target
+            closest_nodes.sort_by_key(|(node_id, _)| Reverse(target.distance(node_id)));
             closest_nodes.truncate(self.config.k);
 
             if queried_nodes.len() >= self.config.k {
@@ -984,8 +981,8 @@ impl KademliaNode {
         Ok(closest_nodes)
     }
 
-    pub async fn find_node_rpc(
-        &self,
+    async fn find_node_rpc(
+        self: &Arc<Self>,
         node_id: NodeId,
         addr: SocketAddr,
         target: NodeId,
@@ -1085,12 +1082,8 @@ impl KademliaNode {
 
     // Methods for state inspection
     pub fn get_routing_table_size(&self) -> usize {
-        let size = self
-            .routing_table
-            .buckets
-            .iter()
-            .map(|bucket| bucket.entries.len())
-            .sum();
+        let size = self.routing_table.read().buckets.iter().map(|bucket| bucket.entries.len()).sum();
+
         debug!("Routing table size: {}", size);
         size
     }
