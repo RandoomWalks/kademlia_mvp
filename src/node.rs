@@ -24,7 +24,9 @@ use tokio::time::sleep;
 use tokio::time::{interval, Duration};
 use dashmap::DashMap;
 use tokio::sync::RwLock;
-
+use rand::seq::SliceRandom;
+use rand::Rng;
+use rand::distributions::{Distribution, WeightedIndex};
 
 use async_trait::async_trait;
 use bincode::{deserialize, serialize};
@@ -180,6 +182,48 @@ impl StorageManager {
     }
 }
 
+pub struct BootstrapTracker {
+    node_success_rates: HashMap<SocketAddr, f64>,
+}
+
+impl BootstrapTracker {
+    pub fn new(bootstrap_nodes: &[SocketAddr]) -> Self {
+        let node_success_rates = bootstrap_nodes
+            .iter()
+            .map(|&addr| (addr, 1.0)) // Initialize all nodes with an equal weight
+            .collect();
+        BootstrapTracker { node_success_rates }
+    }
+
+    pub fn update_success(&mut self, addr: SocketAddr, success: bool) {
+        let entry = self.node_success_rates.entry(addr).or_insert(1.0);
+        if success {
+            *entry *= 1.1; // Increase weight slightly on success
+        } else {
+            *entry *= 0.9; // Decrease weight slightly on failure
+        }
+    }
+
+    pub fn weighted_random_selection(&self) -> Vec<SocketAddr> {
+        let weights: Vec<_> = self.node_success_rates.values().cloned().collect();
+        let dist = WeightedIndex::new(&weights).unwrap();
+        let mut rng = rand::thread_rng();
+        let mut selected_nodes: Vec<SocketAddr> = Vec::new();
+
+        for _ in 0..self.node_success_rates.len() {
+            let index = dist.sample(&mut rng);
+            selected_nodes.push(*self.node_success_rates.keys().nth(index).unwrap());
+        }
+
+        selected_nodes
+    }
+}
+
+pub fn calculate_adaptive_jitter(attempt: usize, base_delay: Duration) -> Duration {
+    let max_jitter = base_delay * (attempt as u32); // Increase jitter with each attempt
+    let jitter: u64 = rand::thread_rng().gen_range(0..max_jitter.as_millis() as u64);
+    Duration::from_millis(jitter)
+}
 // Kademlia Node
 pub struct KademliaNode {
     pub id: NodeId,
@@ -245,177 +289,103 @@ impl KademliaNode {
         }
     }
 
-    // pub async fn bootstrap(&mut self) -> Result<(), KademliaError> {
-    //     info!("Node {:?} starting bootstrap process", self.id);
 
-    //     let mut successful_contacts = Vec::new();
-
-    //     for &bootstrap_addr in &self.bootstrap_nodes {
-    //         for attempt in 1..=3 {
-    //             match self.ping(bootstrap_addr).await {
-    //                 Ok(_) => {
-    //                     info!("Successfully pinged bootstrap node at {}", bootstrap_addr);
-    //                     successful_contacts.push(bootstrap_addr);
-    //                     break; // Break out of the retry loop on success
-    //                 }
-    //                 Err(e) => {
-    //                     warn!(
-    //                         "Failed to ping bootstrap node at {}: {:?}. Attempt {}/3",
-    //                         bootstrap_addr, e, attempt
-    //                     );
-    //                     if attempt < 3 {
-    //                         sleep(Duration::from_secs(1)).await;
-    //                     }
-    //                 }
-    //             }
-    //         }
-    //     }
-
-    //     if successful_contacts.is_empty() {
-    //         warn!("No bootstrap nodes responded. Marking this node as the first in the network.");
-    //         self.routing_table.update(self.id, self.addr); // Manually add itself to the routing table
-    //         debug!(
-    //             "Updated routing table with node {:?} at address {}",
-    //             self.id, self.addr
-    //         );
-    //         return Ok(()); // Exit the bootstrap process as this node is now the first node
-    //     }
-
-    //     for &contact in &successful_contacts {
-    //         match self.find_node(self.id).await {
-    //             Ok(nodes) => {
-    //                 info!(
-    //                     "Found {} nodes from bootstrap node {}",
-    //                     nodes.len(),
-    //                     contact
-    //                 );
-    //                 for (node_id, addr) in nodes {
-    //                     self.routing_table.update(node_id, addr);
-    //                     debug!(
-    //                         "Updated routing table with node {:?} at address {}",
-    //                         node_id, addr
-    //                     );
-
-    //                     if self.ping(addr).await.is_ok() {
-    //                         info!(
-    //                             "Successfully pinged and added node {:?} at {} to routing table",
-    //                             node_id, addr
-    //                         );
-    //                     }
-    //                 }
-    //             }
-    //             Err(e) => {
-    //                 warn!(
-    //                     "Failed to find nodes from bootstrap node {}: {:?}",
-    //                     contact, e
-    //                 );
-    //             }
-    //         }
-    //     }
-
-    //     let table_size = self.get_routing_table_size();
-    //     info!(
-    //         "Bootstrap process completed for node {:?}. Routing table size: {}",
-    //         self.id, table_size
-    //     );
-
-    //     if table_size == 0 {
-    //         warn!("Routing table is empty after bootstrap. This might be the first node in the network.");
-    //     }
-
-    //     Ok(())
-    // }
     pub async fn bootstrap(&mut self) -> Result<(), KademliaError> {
         info!("Node {:?} starting bootstrap process", self.id);
-
-        let mut successful_contacts = Vec::new();
-
-        for &bootstrap_addr in &self.bootstrap_nodes {
-            for attempt in 1..=3 {
-                match self.ping(bootstrap_addr).await {
-                    Ok(_) => {
-                        info!("Successfully pinged bootstrap node at {}", bootstrap_addr);
-                        successful_contacts.push(bootstrap_addr);
-                        break; // Break out of the retry loop on success
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to ping bootstrap node at {}: {:?}. Attempt {}/3",
-                            bootstrap_addr, e, attempt
-                        );
-                        if attempt < 3 {
-                            sleep(Duration::from_secs(1)).await;
+    
+        let mut tracker = BootstrapTracker::new(&self.bootstrap_nodes);
+    
+        loop {
+            let bootstrap_nodes = tracker.weighted_random_selection();
+            let mut successful_contacts = Vec::new();
+    
+            for &bootstrap_addr in &bootstrap_nodes {
+                for attempt in 1..=3 {
+                    match self.ping(bootstrap_addr).await {
+                        Ok(_) => {
+                            info!("Successfully pinged bootstrap node at {}", bootstrap_addr);
+                            successful_contacts.push(bootstrap_addr);
+                            tracker.update_success(bootstrap_addr, true);
+                            break; // Break out of the retry loop on success
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to ping bootstrap node at {}: {:?}. Attempt {}/3",
+                                bootstrap_addr, e, attempt
+                            );
+                            tracker.update_success(bootstrap_addr, false);
+                            let base_delay = Duration::from_millis(100 * 2_u64.pow(attempt - 1));
+                            let adaptive_jitter = calculate_adaptive_jitter(attempt, base_delay);
+                            sleep(base_delay + adaptive_jitter).await;  // Exponential backoff with adaptive jitter
                         }
                     }
                 }
             }
-        }
-
-        if successful_contacts.is_empty() {
-            warn!("No bootstrap nodes responded. Marking this node as the first in the network.");
-            self.routing_table.update(self.id, self.addr); // Manually add itself to the routing table
-            debug!(
-                "Updated routing table with node {:?} at address {}",
-                self.id, self.addr
-            );
-
-            return Ok(()); // Exit the bootstrap process as this node is now the first node
-        }
-
-        for &contact in &successful_contacts {
-            match self.find_node(self.id).await {
-                Ok(nodes) => {
-                    info!(
-                        "Found {} nodes from bootstrap node {}",
-                        nodes.len(),
-                        contact
-                    );
-                    for (node_id, addr) in nodes {
-                        self.routing_table.update(node_id, addr);
-                        debug!(
-                            "Updated routing table with node {:?} at address {}",
-                            node_id, addr
-                        );
-
-                        if self.ping(addr).await.is_ok() {
+    
+            if !successful_contacts.is_empty() {
+                // Proceed with the bootstrap process using successful contacts
+                for &contact in &successful_contacts {
+                    match self.find_node(self.id).await {
+                        Ok(nodes) => {
                             info!(
-                                "Successfully pinged and added node {:?} at {} to routing table",
-                                node_id, addr
+                                "Found {} nodes from bootstrap node {}",
+                                nodes.len(),
+                                contact
+                            );
+                            for (node_id, addr) in nodes {
+                                self.routing_table.update(node_id, addr);
+                                debug!(
+                                    "Updated routing table with node {:?} at address {}",
+                                    node_id, addr
+                                );
+    
+                                if self.ping(addr).await.is_ok() {
+                                    info!(
+                                        "Successfully pinged and added node {:?} at {} to routing table",
+                                        node_id, addr
+                                    );
+                                }
+                            }
+    
+                            // Ensure that the contact node is added to the routing table if not already present
+                            if !self
+                                .routing_table
+                                .find_closest(&self.id, 1)
+                                .iter()
+                                .any(|(_, addr)| *addr == contact)
+                            {
+                                self.routing_table.update(self.id, contact);
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to find nodes from bootstrap node {}: {:?}",
+                                contact, e
                             );
                         }
                     }
-
-                    // Ensure that the contact node is added to the routing table if not already present
-                    if !self
-                        .routing_table
-                        .find_closest(&self.id, 1)
-                        .iter()
-                        .any(|(_, addr)| *addr == contact)
-                    {
-                        self.routing_table.update(self.id, contact);
-                    }
                 }
-                Err(e) => {
-                    warn!(
-                        "Failed to find nodes from bootstrap node {}: {:?}",
-                        contact, e
-                    );
+    
+                let table_size = self.get_routing_table_size();
+                info!(
+                    "Bootstrap process completed for node {:?}. Routing table size: {}",
+                    self.id, table_size
+                );
+    
+                if table_size == 0 {
+                    warn!("Routing table is empty after bootstrap. This might be the first node in the network.");
                 }
+    
+                return Ok(());
+            } else {
+                // No successful contacts, retry the bootstrap process after a delay
+                warn!("No bootstrap nodes responded. Retrying the bootstrap process after delay.");
+                let retry_delay = Duration::from_secs(10); // Adjust this delay as necessary
+                sleep(retry_delay).await;
             }
         }
-
-        let table_size = self.get_routing_table_size();
-        info!(
-            "Bootstrap process completed for node {:?}. Routing table size: {}",
-            self.id, table_size
-        );
-
-        if table_size == 0 {
-            warn!("Routing table is empty after bootstrap. This might be the first node in the network.");
-        }
-
-        Ok(())
     }
+    
 
     pub async fn run(&mut self) -> Result<(), KademliaError> {
         let mut refresh_interval = interval(self.config.maintenance_interval);
