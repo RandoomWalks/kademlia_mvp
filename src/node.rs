@@ -6,6 +6,7 @@ use crate::routing_table::RoutingTable;
 use crate::utils::{KademliaError, NodeId};
 
 use crate::utils::{Config, ALPHA, BOOTSTRAP_NODES, K};
+// use anyhow::Ok;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -43,17 +44,24 @@ impl NetworkManager {
     ) -> Result<(), KademliaError> {
         debug!("Sending message to {}: {:?}", dst, message);
         let serialized = bincode::serialize(message)?;
-        self.socket.send_to(&serialized, dst).await?;
+        self.socket.send_to(&serialized, dst).await.map_err(|e| {
+            error!("Failed to send message to {}: {:?}", dst, e);
+            KademliaError::Network(e)
+        });
         Ok(())
     }
-
+    
     pub async fn receive_message(&self) -> Result<(Message, SocketAddr), KademliaError> {
-        let mut buf = vec![0u8; 1024];
-        let (size, src) = self.socket.recv_from(&mut buf).await?;
+        let mut buf: Vec<u8> = vec![0u8; 1024];
+        let (size, src) = self.socket.recv_from(&mut buf).await.map_err(|e| {
+            error!("Failed to receive message: {:?}", e);
+            KademliaError::Network(e)
+        })?;
         let message: Message = bincode::deserialize(&buf[..size])?;
         debug!("Received message from {}: {:?}", src, message);
         Ok((message, src))
     }
+    
 }
 
 // Storage Manager
@@ -391,21 +399,20 @@ impl KademliaNode {
         src: SocketAddr,
     ) -> Result<(), KademliaError> {
         match message {
-            Message::Ping { sender } => self.handle_ping(sender, src).await,
-            Message::Store {
-                key,
-                value,
-                sender,
-                timestamp,
-            } => self.handle_store(key, value, sender, timestamp, src).await,
-            Message::FindNode { target } => self.handle_find_node(target, src).await,
-            Message::FindValue { key } => self.handle_find_value(key, src).await,
+            Message::Ping { sender } => self.handle_ping(sender, src).await?,
+            Message::Store { key, value, sender, timestamp } => {
+                self.handle_store(key, value, sender, timestamp, src).await?
+            }
+            Message::FindNode { target } => self.handle_find_node(target, src).await?,
+            Message::FindValue { key } => self.handle_find_value(key, src).await?,
             _ => {
                 warn!("Received unknown message type from {}", src);
-                Ok(())
+                return Err(KademliaError::InvalidMessage);
             }
         }
+        Ok(())
     }
+    
 
     pub async fn handle_ping(
         &mut self,
@@ -433,15 +440,14 @@ impl KademliaNode {
     ) -> Result<(), KademliaError> {
         debug!("Handling P2P STORE request for key: {:?}", key);
         self.validate_key_value(&key, &value)?;
-        debug!("Storing data in P2P store");
         self.storage_manager.store(&key, &value).await?;
-
+    
         self.routing_table.update(sender, src);
         debug!(
             "handle_store:: Updated routing table with node {:?} at address {}",
             sender, src
         );
-
+    
         self.network_manager
             .send_message(
                 &Message::StoreResponse {
@@ -450,8 +456,11 @@ impl KademliaNode {
                 },
                 src,
             )
-            .await
+            .await?;
+        
+        Ok(())
     }
+    
 
     pub async fn handle_find_node(
         &self,
@@ -712,7 +721,7 @@ impl KademliaNode {
         self.network_manager
             .send_message(&Message::Ping { sender: self.id }, addr)
             .await?;
-
+    
         match tokio::time::timeout(
             self.config.request_timeout,
             self.network_manager.receive_message(),
@@ -736,6 +745,7 @@ impl KademliaNode {
             }
         }
     }
+    
 
     pub async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), KademliaError> {
         info!("Attempting to store key: {:?}", key);
@@ -963,7 +973,7 @@ impl KademliaNode {
             addr, key, value
         );
         self.network_manager.send_message(&message, addr).await?;
-
+    
         match tokio::time::timeout(
             self.config.request_timeout,
             self.network_manager.receive_message(),
@@ -999,6 +1009,7 @@ impl KademliaNode {
             }
         }
     }
+    
 
     // Methods for state inspection
     pub fn get_routing_table_size(&self) -> usize {
