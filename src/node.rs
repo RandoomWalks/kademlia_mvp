@@ -27,8 +27,8 @@ use bincode::{deserialize, serialize};
 
 // Network Manager
 pub struct NetworkManager {
-    socket: Arc<UdpSocket>,
-    config: Arc<Config>,
+    pub socket: Arc<UdpSocket>,
+    pub config: Arc<Config>,
 }
 
 impl NetworkManager {
@@ -58,9 +58,9 @@ impl NetworkManager {
 
 // Storage Manager
 pub struct StorageManager {
-    storage: HashMap<Vec<u8>, Vec<u8>>,
-    cache: cache_impl::Cache<Vec<u8>, Vec<u8>>,
-    config: Arc<Config>,
+    pub storage: HashMap<Vec<u8>, Vec<u8>>,
+    pub cache: cache_impl::Cache<Vec<u8>, Vec<u8>>,
+    pub config: Arc<Config>,
 }
 
 impl StorageManager {
