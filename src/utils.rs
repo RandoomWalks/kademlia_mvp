@@ -28,6 +28,7 @@ pub enum KademliaError {
     UnexpectedResponse,
     InvalidData(&'static str),
     InvalidMessage,
+    BootstrapFailed,
 }
 
 impl From<std::io::Error> for KademliaError {
