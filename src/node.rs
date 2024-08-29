@@ -22,9 +22,34 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio::time::{interval, Duration};
+use dashmap::DashMap;
+use tokio::sync::RwLock;
+
 
 use async_trait::async_trait;
 use bincode::{deserialize, serialize};
+
+
+pub async fn exponential_backoff<F, T, E>(mut operation: F, retries: usize) -> Result<T, E>
+where
+    F: FnMut() -> Pin<Box<dyn Future<Output = Result<T, E>>>>,
+    E: std::error::Error + Send + Sync + 'static + From<KademliaError>,
+{
+    let mut delay = Duration::from_millis(100);
+
+    for attempt in 0..=retries {
+        match operation().await {
+            Ok(result) => return Ok(result),
+            Err(err) if attempt < retries => {
+                sleep(delay).await;
+                delay *= 2; // Exponential backoff
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Err(KademliaError::Timeout.into())
+}
 
 // Network Manager
 pub struct NetworkManager {
@@ -37,36 +62,69 @@ impl NetworkManager {
         NetworkManager { socket, config }
     }
 
+    // pub async fn send_message(
+    //     &self,
+    //     message: &Message,
+    //     dst: SocketAddr,
+    // ) -> Result<(), KademliaError> {
+    //     debug!("Sending message to {}: {:?}", dst, message);
+    //     let serialized = bincode::serialize(message)?;
+    //     self.socket.send_to(&serialized, dst).await.map_err(|e| {
+    //         error!("Failed to send message to {}: {:?}", dst, e);
+    //         KademliaError::Network(e)
+    //     });
+    //     Ok(())
+    // }
+
     pub async fn send_message(
         &self,
         message: &Message,
         dst: SocketAddr,
     ) -> Result<(), KademliaError> {
         debug!("Sending message to {}: {:?}", dst, message);
-        let serialized = bincode::serialize(message)?;
-        self.socket.send_to(&serialized, dst).await.map_err(|e| {
-            error!("Failed to send message to {}: {:?}", dst, e);
-            KademliaError::Network(e)
-        });
-        Ok(())
-    }
     
+        exponential_backoff(
+            || {
+                let message = message.clone();
+                let socket = Arc::clone(&self.socket);
+                Box::pin(async move {
+                    let serialized = bincode::serialize(&message)?;
+                    socket.send_to(&serialized, dst).await.map(|_| ()).map_err(|e| {
+                        error!("Failed to send message to {}: {:?}", dst, e);
+                        KademliaError::Network(e)
+                    })
+                }) as Pin<Box<dyn Future<Output = Result<(), KademliaError>>>>
+            },
+            3, // Number of retries
+        )
+        .await
+    }
+
     pub async fn receive_message(&self) -> Result<(Message, SocketAddr), KademliaError> {
-        let mut buf: Vec<u8> = vec![0u8; 1024];
-        let (size, src) = self.socket.recv_from(&mut buf).await.map_err(|e| {
-            error!("Failed to receive message: {:?}", e);
-            KademliaError::Network(e)
-        })?;
-        let message: Message = bincode::deserialize(&buf[..size])?;
-        debug!("Received message from {}: {:?}", src, message);
-        Ok((message, src))
+        let socket = Arc::clone(&self.socket);
+        exponential_backoff(
+            move || {
+                Box::pin(async move {
+                    let mut buf = vec![0u8; 1024];
+                    let (size, src) = socket.recv_from(&mut buf).await.map_err(|e| {
+                        error!("Failed to receive message: {:?}", e);
+                        KademliaError::Network(e)
+                    })?;
+                    let message: Message = bincode::deserialize(&buf[..size])?;
+                    debug!("Received message from {}: {:?}", src, message);
+                    Ok((message, src))
+                }) as Pin<Box<dyn Future<Output = Result<(Message, SocketAddr), KademliaError>>>>
+            },
+            3, // Number of retries
+        )
+        .await
     }
     
 }
 
 // Storage Manager
 pub struct StorageManager {
-    pub storage: HashMap<Vec<u8>, Vec<u8>>,
+    pub storage: Arc<RwLock<DashMap<Vec<u8>, Vec<u8>>>>,
     pub cache: cache_impl::Cache<Vec<u8>, Vec<u8>>,
     pub config: Arc<Config>,
 }
@@ -74,16 +132,17 @@ pub struct StorageManager {
 impl StorageManager {
     pub fn new(config: Arc<Config>) -> Self {
         StorageManager {
-            storage: HashMap::new(),
+            storage: Arc::new(RwLock::new(DashMap::new())),
             cache: cache_impl::Cache::with_policy(policy::EvictionPolicy::LRU, config.cache_size),
             config,
         }
     }
 
-    pub async fn store(&mut self, key: &[u8], value: &[u8]) -> Result<(), KademliaError> {
+    pub async fn store(&self, key: &[u8], value: &[u8]) -> Result<(), KademliaError> {
         debug!("StorageManager: Attempting to store key: {:?}", key);
         let hash = Self::hash_key(key);
-        self.storage.insert(hash.clone(), value.to_vec());
+        let mut storage = self.storage.write().await;
+        storage.insert(hash.clone(), value.to_vec());
         self.cache
             .put(hash.clone(), value.to_vec(), self.config.cache_ttl)
             .await
@@ -95,25 +154,25 @@ impl StorageManager {
     pub async fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         debug!("StorageManager: Attempting to retrieve key: {:?}", key);
         let hash = Self::hash_key(key);
-        let result = if let Ok(value) = self.cache.get(&hash).await {
+        if let Ok(value) = self.cache.get(&hash).await {
             debug!(
                 "StorageManager: Retrieved value from cache for key: {:?}",
                 key
             );
-            Some(value)
-        } else {
-            let value = self.storage.get(&hash).cloned();
-            if value.is_some() {
-                debug!(
-                    "StorageManager: Retrieved value from storage for key: {:?}",
-                    key
-                );
-            } else {
-                debug!("StorageManager: No value found for key: {:?}", key);
-            }
-            value
-        };
-        result
+            return Some(value);
+        }
+
+        let storage = self.storage.read().await;
+        if let Some(value) = storage.get(&hash) {
+            debug!(
+                "StorageManager: Retrieved value from storage for key: {:?}",
+                key
+            );
+            return Some(value.clone());
+        }
+
+        debug!("StorageManager: No value found for key: {:?}", key);
+        None
     }
 
     pub fn hash_key(key: &[u8]) -> Vec<u8> {
@@ -152,11 +211,11 @@ impl KademliaNode {
         let addr = socket.local_addr()?;
         let id = NodeId::new();
         let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
-
+    
         let config = Arc::new(config.unwrap_or_default());
-
+    
         info!("KademliaNode bound to address: {}", addr);
-
+    
         Ok((
             KademliaNode {
                 id: id.clone(),
@@ -171,6 +230,7 @@ impl KademliaNode {
             shutdown_sender,
         ))
     }
+    
 
     fn is_same_node(&self, addr1: SocketAddr, addr2: SocketAddr) -> bool {
         if addr1 == addr2 {
@@ -618,14 +678,11 @@ impl KademliaNode {
     }
 
     fn validate_key_value(&self, key: &[u8], value: &[u8]) -> Result<(), KademliaError> {
-        const MAX_KEY_SIZE: usize = 32;
-        const MAX_VALUE_SIZE: usize = 1024;
-
-        if key.len() > MAX_KEY_SIZE {
+        if key.len() > self.config.max_key_size {
             Err(KademliaError::InvalidData(
                 "Key size exceeds maximum allowed",
             ))
-        } else if value.len() > MAX_VALUE_SIZE {
+        } else if value.len() > self.config.max_value_size {
             Err(KademliaError::InvalidData(
                 "Value size exceeds maximum allowed",
             ))
@@ -633,6 +690,7 @@ impl KademliaNode {
             Ok(())
         }
     }
+    
 
     pub async fn find_value(&self, key: &[u8]) -> FindValueResult {
         debug!("Searching for value associated with key: {:?}", key);
@@ -718,33 +776,43 @@ impl KademliaNode {
 
     pub async fn ping(&self, addr: SocketAddr) -> Result<(), KademliaError> {
         debug!("Pinging node at {} from {}", addr, self.addr);
-        self.network_manager
-            .send_message(&Message::Ping { sender: self.id }, addr)
-            .await?;
     
-        match tokio::time::timeout(
-            self.config.request_timeout,
-            self.network_manager.receive_message(),
+        exponential_backoff(
+            || {
+                Box::pin(async move {
+                    self.network_manager
+                        .send_message(&Message::Ping { sender: self.id }, addr)
+                        .await?;
+    
+                    match tokio::time::timeout(
+                        self.config.request_timeout,
+                        self.network_manager.receive_message(),
+                    )
+                    .await
+                    {
+                        Ok(Ok((Message::Pong { sender }, src))) => {
+                            if self.is_same_node(addr, src) {
+                                debug!("Received pong from {:?} at {}", sender, src);
+                                Ok(())
+                            } else {
+                                error!("Unexpected response from {}", src);
+                                Err(KademliaError::UnexpectedResponse)
+                            }
+                        }
+                        Ok(Ok(_)) => Err(KademliaError::UnexpectedResponse),
+                        Ok(Err(e)) => Err(e),
+                        Err(_) => {
+                            warn!("Timeout waiting for pong from {}", addr);
+                            Err(KademliaError::Timeout)
+                        }
+                    }
+                })
+            },
+            3, // Number of retries
         )
         .await
-        {
-            Ok(Ok((Message::Pong { sender }, src))) => {
-                if self.is_same_node(addr, src) {
-                    debug!("Received pong from {:?} at {}", sender, src);
-                    Ok(())
-                } else {
-                    error!("Unexpected response from {}", src);
-                    Err(KademliaError::UnexpectedResponse)
-                }
-            }
-            Ok(Ok(_)) => Err(KademliaError::UnexpectedResponse),
-            Ok(Err(e)) => Err(e),
-            Err(_) => {
-                warn!("Timeout waiting for pong from {}", addr);
-                Err(KademliaError::Timeout)
-            }
-        }
     }
+    
     
 
     pub async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), KademliaError> {
@@ -972,43 +1040,53 @@ impl KademliaNode {
             "Sending STORE message to {} for key: {:?}, value: {:?}",
             addr, key, value
         );
-        self.network_manager.send_message(&message, addr).await?;
     
-        match tokio::time::timeout(
-            self.config.request_timeout,
-            self.network_manager.receive_message(),
+        exponential_backoff(
+            || {
+                Box::pin(async move {
+                    self.network_manager.send_message(&message, addr).await?;
+    
+                    match tokio::time::timeout(
+                        self.config.request_timeout,
+                        self.network_manager.receive_message(),
+                    )
+                    .await
+                    {
+                        Ok(Ok((
+                            Message::StoreResponse {
+                                success,
+                                error_message,
+                            },
+                            _,
+                        ))) => {
+                            if !success {
+                                warn!("Store failed on node {}: {:?}", addr, error_message);
+                            }
+                            Ok(success)
+                        }
+                        Ok(Err(e)) => {
+                            error!("Error receiving STORE response from {}: {:?}", addr, e);
+                            Err(e)
+                        }
+                        Err(_) => {
+                            warn!("Timeout waiting for STORE response from {}", addr);
+                            Err(KademliaError::Timeout)
+                        }
+                        _ => {
+                            error!(
+                                "Unexpected response while waiting for STORE confirmation from {}",
+                                addr
+                            );
+                            Err(KademliaError::UnexpectedResponse)
+                        }
+                    }
+                })
+            },
+            3, // Number of retries
         )
         .await
-        {
-            Ok(Ok((
-                Message::StoreResponse {
-                    success,
-                    error_message,
-                },
-                _,
-            ))) => {
-                if !success {
-                    warn!("Store failed on node {}: {:?}", addr, error_message);
-                }
-                Ok(success)
-            }
-            Ok(Err(e)) => {
-                error!("Error receiving STORE response from {}: {:?}", addr, e);
-                Err(e)
-            }
-            Err(_) => {
-                warn!("Timeout waiting for STORE response from {}", addr);
-                Err(KademliaError::Timeout)
-            }
-            _ => {
-                error!(
-                    "Unexpected response while waiting for STORE confirmation from {}",
-                    addr
-                );
-                Err(KademliaError::UnexpectedResponse)
-            }
-        }
     }
+    
     
 
     // Methods for state inspection
@@ -1024,7 +1102,8 @@ impl KademliaNode {
     }
 
     pub async fn get_storage_size(&self) -> usize {
-        let size = self.storage_manager.storage.len();
+        let storage = self.storage_manager.storage.read().await;
+        let size = storage.len();
         debug!("Local storage size: {}", size);
         size
     }
