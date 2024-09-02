@@ -1,12 +1,18 @@
 use crate::cache::cache_impl;
 use crate::cache::entry;
 use crate::cache::policy;
+use crate::message;
 use crate::message::{FindValueResult, Message};
 use crate::routing_table::RoutingTable;
 use crate::utils::{KademliaError, NodeId};
 
 use crate::utils::{Config, ALPHA, BOOTSTRAP_NODES, K};
+// use anyhow::Ok;
+use dashmap::DashMap;
 use log::{debug, error, info, warn};
+use rand::distributions::{Distribution, WeightedIndex};
+use rand::seq::SliceRandom;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -19,13 +25,38 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tokio::time::{interval, Duration};
 
 use async_trait::async_trait;
 use bincode::{deserialize, serialize};
+const MAX_RETRIES: usize = 5; // prevent the function from entering an infinite loop if no bootstrap nodes respond successfully.
+const MIN_SUCCESSFUL_CONTACTS: usize = 2; // minimum successful contacts requirement before proceeding with the bootstrap process.
+
+pub async fn exponential_backoff<F, T, E>(mut operation: F, retries: usize) -> Result<T, E>
+where
+    F: FnMut() -> Pin<Box<dyn Future<Output = Result<T, E>>>>,
+    E: std::error::Error + Send + Sync + 'static + From<KademliaError>,
+{
+    let mut delay = Duration::from_millis(100);
+
+    for attempt in 0..=retries {
+        match operation().await {
+            Ok(result) => return Ok(result),
+            Err(err) if attempt < retries => {
+                sleep(delay).await;
+                delay *= 2; // Exponential backoff
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Err(KademliaError::Timeout.into())
+}
 
 // Network Manager
+#[derive(Clone)]
 pub struct NetworkManager {
     pub socket: Arc<UdpSocket>,
     pub config: Arc<Config>,
@@ -36,29 +67,85 @@ impl NetworkManager {
         NetworkManager { socket, config }
     }
 
+    // pub async fn send_message(
+    //     &self,
+    //     message: &Message,
+    //     dst: SocketAddr,
+    // ) -> Result<(), KademliaError> {
+    //     debug!("Sending message to {}: {:?}", dst, message);
+    //     let serialized = bincode::serialize(message)?;
+    //     self.socket.send_to(&serialized, dst).await.map_err(|e| {
+    //         error!("Failed to send message to {}: {:?}", dst, e);
+    //         KademliaError::Network(e)
+    //     });
+    //     Ok(())
+    // }
+
     pub async fn send_message(
         &self,
-        message: &Message,
+        message: Message,
         dst: SocketAddr,
     ) -> Result<(), KademliaError> {
         debug!("Sending message to {}: {:?}", dst, message);
-        let serialized = bincode::serialize(message)?;
-        self.socket.send_to(&serialized, dst).await?;
-        Ok(())
+
+        let message = Arc::new(message);
+
+        exponential_backoff(
+            || {
+                let message_clone = message.clone();
+
+                let socket = Arc::clone(&self.socket);
+
+                Box::pin(async move {
+                    let serialized = bincode::serialize(&*message_clone)?;
+                    /// Serializes a serializable object into a `Vec` of bytes using the default configuration.
+                    socket
+                        .send_to(&serialized, dst)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| {
+                            error!("Failed to send message to {}: {:?}", dst, e);
+                            KademliaError::Network(e)
+                        })
+                })
+            },
+            3, // Number of retries
+        )
+        .await
     }
 
     pub async fn receive_message(&self) -> Result<(Message, SocketAddr), KademliaError> {
-        let mut buf = vec![0u8; 1024];
-        let (size, src) = self.socket.recv_from(&mut buf).await?;
-        let message: Message = bincode::deserialize(&buf[..size])?;
-        debug!("Received message from {}: {:?}", src, message);
-        Ok((message, src))
+        let socket_clone = Arc::clone(&self.socket);
+
+        exponential_backoff(
+            move || {
+                let socket_clone = Arc::clone(&socket_clone); // Clone here
+
+                Box::pin(async move {
+                    let mut buf = vec![0u8; 1024];
+
+                    let (size, src) = socket_clone.recv_from(&mut buf).await.map_err(|e| {
+                        error!("Failed to receive message: {:?}", e);
+                        KademliaError::Network(e)
+                    })?;
+
+                    let message: Message = bincode::deserialize(&buf[..size])?;
+
+                    debug!("Received message from {}: {:?}", src, message);
+
+                    Ok((message, src))
+                })
+                    as Pin<Box<dyn Future<Output = Result<(Message, SocketAddr), KademliaError>>>>
+            },
+            3, // Number of retries
+        )
+        .await
     }
 }
 
 // Storage Manager
 pub struct StorageManager {
-    pub storage: HashMap<Vec<u8>, Vec<u8>>,
+    pub storage: Arc<RwLock<DashMap<Vec<u8>, Vec<u8>>>>,
     pub cache: cache_impl::Cache<Vec<u8>, Vec<u8>>,
     pub config: Arc<Config>,
 }
@@ -66,16 +153,17 @@ pub struct StorageManager {
 impl StorageManager {
     pub fn new(config: Arc<Config>) -> Self {
         StorageManager {
-            storage: HashMap::new(),
+            storage: Arc::new(RwLock::new(DashMap::new())),
             cache: cache_impl::Cache::with_policy(policy::EvictionPolicy::LRU, config.cache_size),
             config,
         }
     }
 
-    pub async fn store(&mut self, key: &[u8], value: &[u8]) -> Result<(), KademliaError> {
+    pub async fn store(&self, key: &[u8], value: &[u8]) -> Result<(), KademliaError> {
         debug!("StorageManager: Attempting to store key: {:?}", key);
         let hash = Self::hash_key(key);
-        self.storage.insert(hash.clone(), value.to_vec());
+        let mut storage = self.storage.write().await;
+        storage.insert(hash.clone(), value.to_vec());
         self.cache
             .put(hash.clone(), value.to_vec(), self.config.cache_ttl)
             .await
@@ -87,30 +175,77 @@ impl StorageManager {
     pub async fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         debug!("StorageManager: Attempting to retrieve key: {:?}", key);
         let hash = Self::hash_key(key);
-        let result = if let Ok(value) = self.cache.get(&hash).await {
+        if let Ok(value) = self.cache.get(&hash).await {
             debug!(
                 "StorageManager: Retrieved value from cache for key: {:?}",
                 key
             );
-            Some(value)
-        } else {
-            let value = self.storage.get(&hash).cloned();
-            if value.is_some() {
-                debug!(
-                    "StorageManager: Retrieved value from storage for key: {:?}",
-                    key
-                );
-            } else {
-                debug!("StorageManager: No value found for key: {:?}", key);
-            }
-            value
-        };
-        result
+            return Some(value);
+        }
+
+        let storage = self.storage.read().await;
+        if let Some(value) = storage.get(&hash) {
+            debug!(
+                "StorageManager: Retrieved value from storage for key: {:?}",
+                key
+            );
+            return Some(value.clone());
+        }
+
+        debug!("StorageManager: No value found for key: {:?}", key);
+        None
     }
 
     pub fn hash_key(key: &[u8]) -> Vec<u8> {
         Sha256::digest(key).to_vec()
     }
+}
+
+pub struct BootstrapTracker {
+    node_success_rates: HashMap<SocketAddr, f64>,
+}
+
+impl BootstrapTracker {
+    pub fn new(bootstrap_nodes: &[SocketAddr]) -> Self {
+        let node_success_rates = bootstrap_nodes
+            .iter()
+            .map(|&addr| (addr, 1.0)) // Initialize all nodes with an equal weight
+            .collect();
+        BootstrapTracker { node_success_rates }
+    }
+
+    pub fn update_success(&mut self, addr: SocketAddr, success: bool) {
+        let entry = self.node_success_rates.entry(addr).or_insert(1.0);
+        if success {
+            *entry *= 1.1; // Increase weight slightly on success
+        } else {
+            *entry *= 0.9; // Decrease weight slightly on failure
+        }
+    }
+
+    pub fn weighted_random_selection(&self) -> Vec<SocketAddr> {
+        let weights: Vec<_> = self.node_success_rates.values().cloned().collect();
+        let dist = WeightedIndex::new(&weights).unwrap();
+        let mut rng = rand::thread_rng();
+        let mut selected_nodes: Vec<SocketAddr> = Vec::new();
+
+        for _ in 0..self.node_success_rates.len() {
+            let index = dist.sample(&mut rng);
+            selected_nodes.push(*self.node_success_rates.keys().nth(index).unwrap());
+        }
+
+        selected_nodes
+    }
+}
+
+pub fn calculate_adaptive_jitter(
+    attempt: usize,
+    base_delay: Duration,
+    retry_count: usize,
+) -> Duration {
+    let max_jitter = base_delay * (attempt as u32) * (retry_count as u32); // Increase jitter with each attempt and retry count
+    let jitter: u64 = rand::thread_rng().gen_range(0..max_jitter.as_millis() as u64);
+    Duration::from_millis(jitter)
 }
 
 // Kademlia Node
@@ -164,7 +299,7 @@ impl KademliaNode {
         ))
     }
 
-    fn is_same_node(&self, addr1: SocketAddr, addr2: SocketAddr) -> bool {
+    fn is_same_node(addr1: SocketAddr, addr2: SocketAddr) -> bool {
         if addr1 == addr2 {
             return true;
         }
@@ -177,176 +312,119 @@ impl KademliaNode {
         }
     }
 
-    // pub async fn bootstrap(&mut self) -> Result<(), KademliaError> {
-    //     info!("Node {:?} starting bootstrap process", self.id);
-
-    //     let mut successful_contacts = Vec::new();
-
-    //     for &bootstrap_addr in &self.bootstrap_nodes {
-    //         for attempt in 1..=3 {
-    //             match self.ping(bootstrap_addr).await {
-    //                 Ok(_) => {
-    //                     info!("Successfully pinged bootstrap node at {}", bootstrap_addr);
-    //                     successful_contacts.push(bootstrap_addr);
-    //                     break; // Break out of the retry loop on success
-    //                 }
-    //                 Err(e) => {
-    //                     warn!(
-    //                         "Failed to ping bootstrap node at {}: {:?}. Attempt {}/3",
-    //                         bootstrap_addr, e, attempt
-    //                     );
-    //                     if attempt < 3 {
-    //                         sleep(Duration::from_secs(1)).await;
-    //                     }
-    //                 }
-    //             }
-    //         }
-    //     }
-
-    //     if successful_contacts.is_empty() {
-    //         warn!("No bootstrap nodes responded. Marking this node as the first in the network.");
-    //         self.routing_table.update(self.id, self.addr); // Manually add itself to the routing table
-    //         debug!(
-    //             "Updated routing table with node {:?} at address {}",
-    //             self.id, self.addr
-    //         );
-    //         return Ok(()); // Exit the bootstrap process as this node is now the first node
-    //     }
-
-    //     for &contact in &successful_contacts {
-    //         match self.find_node(self.id).await {
-    //             Ok(nodes) => {
-    //                 info!(
-    //                     "Found {} nodes from bootstrap node {}",
-    //                     nodes.len(),
-    //                     contact
-    //                 );
-    //                 for (node_id, addr) in nodes {
-    //                     self.routing_table.update(node_id, addr);
-    //                     debug!(
-    //                         "Updated routing table with node {:?} at address {}",
-    //                         node_id, addr
-    //                     );
-
-    //                     if self.ping(addr).await.is_ok() {
-    //                         info!(
-    //                             "Successfully pinged and added node {:?} at {} to routing table",
-    //                             node_id, addr
-    //                         );
-    //                     }
-    //                 }
-    //             }
-    //             Err(e) => {
-    //                 warn!(
-    //                     "Failed to find nodes from bootstrap node {}: {:?}",
-    //                     contact, e
-    //                 );
-    //             }
-    //         }
-    //     }
-
-    //     let table_size = self.get_routing_table_size();
-    //     info!(
-    //         "Bootstrap process completed for node {:?}. Routing table size: {}",
-    //         self.id, table_size
-    //     );
-
-    //     if table_size == 0 {
-    //         warn!("Routing table is empty after bootstrap. This might be the first node in the network.");
-    //     }
-
-    //     Ok(())
-    // }
     pub async fn bootstrap(&mut self) -> Result<(), KademliaError> {
         info!("Node {:?} starting bootstrap process", self.id);
+        // Introduce a random initial delay to prevent network congestion
+        let initial_delay = Duration::from_millis(rand::thread_rng().gen_range(0..5000));
+        sleep(initial_delay).await;
 
-        let mut successful_contacts = Vec::new();
+        let mut retry_delay = Duration::from_secs(10);
+        let mut tracker = BootstrapTracker::new(&self.bootstrap_nodes);
+        let mut retry_count = 0;
 
-        for &bootstrap_addr in &self.bootstrap_nodes {
-            for attempt in 1..=3 {
-                match self.ping(bootstrap_addr).await {
-                    Ok(_) => {
-                        info!("Successfully pinged bootstrap node at {}", bootstrap_addr);
-                        successful_contacts.push(bootstrap_addr);
-                        break; // Break out of the retry loop on success
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to ping bootstrap node at {}: {:?}. Attempt {}/3",
-                            bootstrap_addr, e, attempt
-                        );
-                        if attempt < 3 {
-                            sleep(Duration::from_secs(1)).await;
+        loop {
+            if retry_count >= MAX_RETRIES {
+                error!("Max retries reached. Bootstrap process failed.");
+                return Err(KademliaError::BootstrapFailed);
+            }
+
+            let bootstrap_nodes = tracker.weighted_random_selection();
+            let mut successful_contacts = Vec::new();
+
+            for &bootstrap_addr in &bootstrap_nodes {
+                for attempt in 1..=3 {
+                    match self.ping(bootstrap_addr).await {
+                        Ok(_) => {
+                            info!("Successfully pinged bootstrap node at {}", bootstrap_addr);
+                            successful_contacts.push(bootstrap_addr);
+                            tracker.update_success(bootstrap_addr, true);
+                            break; // Break out of the retry loop on success
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to ping bootstrap node at {}: {:?}. Attempt {}/3",
+                                bootstrap_addr, e, attempt
+                            );
+                            tracker.update_success(bootstrap_addr, false);
+                            let base_delay = Duration::from_millis(100 * 2_u64.pow(attempt - 1));
+                            let adaptive_jitter = calculate_adaptive_jitter(
+                                attempt as usize,
+                                base_delay,
+                                retry_count,
+                            );
+                            sleep(base_delay + adaptive_jitter).await; // Exponential backoff with adaptive jitter
                         }
                     }
                 }
             }
-        }
+            if successful_contacts.len() < MIN_SUCCESSFUL_CONTACTS {
+                warn!("Not enough bootstrap nodes responded. Retrying...");
+                retry_count += 1;
+                continue;
+            }
 
-        if successful_contacts.is_empty() {
-            warn!("No bootstrap nodes responded. Marking this node as the first in the network.");
-            self.routing_table.update(self.id, self.addr); // Manually add itself to the routing table
-            debug!(
-                "Updated routing table with node {:?} at address {}",
-                self.id, self.addr
-            );
-
-            return Ok(()); // Exit the bootstrap process as this node is now the first node
-        }
-
-        for &contact in &successful_contacts {
-            match self.find_node(self.id).await {
-                Ok(nodes) => {
-                    info!(
-                        "Found {} nodes from bootstrap node {}",
-                        nodes.len(),
-                        contact
-                    );
-                    for (node_id, addr) in nodes {
-                        self.routing_table.update(node_id, addr);
-                        debug!(
-                            "Updated routing table with node {:?} at address {}",
-                            node_id, addr
-                        );
-
-                        if self.ping(addr).await.is_ok() {
+            if !successful_contacts.is_empty() {
+                // Proceed with the bootstrap process using successful contacts
+                for &contact in &successful_contacts {
+                    match self.find_node(self.id).await {
+                        Ok(nodes) => {
                             info!(
-                                "Successfully pinged and added node {:?} at {} to routing table",
-                                node_id, addr
+                                "Found {} nodes from bootstrap node {}",
+                                nodes.len(),
+                                contact
+                            );
+                            for (node_id, addr) in nodes {
+                                self.routing_table.update(node_id, addr);
+                                debug!(
+                                    "Updated routing table with node {:?} at address {}",
+                                    node_id, addr
+                                );
+
+                                if self.ping(addr).await.is_ok() {
+                                    info!(
+                                        "Successfully pinged and added node {:?} at {} to routing table",
+                                        node_id, addr
+                                    );
+                                }
+                            }
+
+                            // Ensure that the contact node is added to the routing table if not already present
+                            if !self
+                                .routing_table
+                                .find_closest(&self.id, 1)
+                                .iter()
+                                .any(|(_, addr)| *addr == contact)
+                            {
+                                self.routing_table.update(self.id, contact);
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to find nodes from bootstrap node {}: {:?}",
+                                contact, e
                             );
                         }
                     }
+                }
 
-                    // Ensure that the contact node is added to the routing table if not already present
-                    if !self
-                        .routing_table
-                        .find_closest(&self.id, 1)
-                        .iter()
-                        .any(|(_, addr)| *addr == contact)
-                    {
-                        self.routing_table.update(self.id, contact);
-                    }
+                let table_size = self.get_routing_table_size();
+                info!(
+                    "Bootstrap process completed for node {:?}. Routing table size: {}",
+                    self.id, table_size
+                );
+
+                if table_size == 0 {
+                    warn!("Routing table is empty after bootstrap. This might be the first node in the network.");
                 }
-                Err(e) => {
-                    warn!(
-                        "Failed to find nodes from bootstrap node {}: {:?}",
-                        contact, e
-                    );
-                }
+                return Ok(());
+            } else {
+                // No successful contacts, retry the bootstrap process after a delay
+                warn!("No bootstrap nodes responded. Retrying the bootstrap process after delay.");
+                sleep(retry_delay).await;
+                retry_delay *= 2; // Exponential increase of retry delay
+                retry_count += 1;
             }
         }
-
-        let table_size = self.get_routing_table_size();
-        info!(
-            "Bootstrap process completed for node {:?}. Routing table size: {}",
-            self.id, table_size
-        );
-
-        if table_size == 0 {
-            warn!("Routing table is empty after bootstrap. This might be the first node in the network.");
-        }
-
-        Ok(())
     }
 
     pub async fn run(&mut self) -> Result<(), KademliaError> {
@@ -391,20 +469,24 @@ impl KademliaNode {
         src: SocketAddr,
     ) -> Result<(), KademliaError> {
         match message {
-            Message::Ping { sender } => self.handle_ping(sender, src).await,
+            Message::Ping { sender } => self.handle_ping(sender, src).await?,
             Message::Store {
                 key,
                 value,
                 sender,
                 timestamp,
-            } => self.handle_store(key, value, sender, timestamp, src).await,
-            Message::FindNode { target } => self.handle_find_node(target, src).await,
-            Message::FindValue { key } => self.handle_find_value(key, src).await,
+            } => {
+                self.handle_store(key, value, sender, timestamp, src)
+                    .await?
+            }
+            Message::FindNode { target } => self.handle_find_node(target, src).await?,
+            Message::FindValue { key } => self.handle_find_value(key, src).await?,
             _ => {
                 warn!("Received unknown message type from {}", src);
-                Ok(())
+                return Err(KademliaError::InvalidMessage);
             }
         }
+        Ok(())
     }
 
     pub async fn handle_ping(
@@ -419,7 +501,7 @@ impl KademliaNode {
         );
 
         self.network_manager
-            .send_message(&Message::Pong { sender: self.id }, src)
+            .send_message(Message::Pong { sender: self.id }, src)
             .await
     }
 
@@ -433,7 +515,6 @@ impl KademliaNode {
     ) -> Result<(), KademliaError> {
         debug!("Handling P2P STORE request for key: {:?}", key);
         self.validate_key_value(&key, &value)?;
-        debug!("Storing data in P2P store");
         self.storage_manager.store(&key, &value).await?;
 
         self.routing_table.update(sender, src);
@@ -444,13 +525,15 @@ impl KademliaNode {
 
         self.network_manager
             .send_message(
-                &Message::StoreResponse {
+                Message::StoreResponse {
                     success: true,
                     error_message: None,
                 },
                 src,
             )
-            .await
+            .await?;
+
+        Ok(())
     }
 
     pub async fn handle_find_node(
@@ -465,7 +548,7 @@ impl KademliaNode {
         );
 
         let response = Message::NodesFound(closest_nodes);
-        self.network_manager.send_message(&response, src).await
+        self.network_manager.send_message(response, src).await
     }
 
     pub async fn handle_find_value(
@@ -478,7 +561,7 @@ impl KademliaNode {
             FindValueResult::Value(value) => {
                 debug!("Value found locally for key: {:?}", key);
                 self.network_manager
-                    .send_message(&Message::ValueFound(value), src)
+                    .send_message(Message::ValueFound(value), src)
                     .await
             }
             FindValueResult::Nodes(nodes) => {
@@ -487,7 +570,7 @@ impl KademliaNode {
                     key
                 );
                 self.network_manager
-                    .send_message(&Message::NodesFound(nodes), src)
+                    .send_message(Message::NodesFound(nodes), src)
                     .await
             }
         }
@@ -588,7 +671,7 @@ impl KademliaNode {
             success,
             error_message,
         };
-        self.network_manager.send_message(&response, dst).await
+        self.network_manager.send_message(response, dst).await
     }
 
     pub async fn send_client_get_response(
@@ -605,18 +688,15 @@ impl KademliaNode {
             value,
             error_message,
         };
-        self.network_manager.send_message(&response, dst).await
+        self.network_manager.send_message(response, dst).await
     }
 
     fn validate_key_value(&self, key: &[u8], value: &[u8]) -> Result<(), KademliaError> {
-        const MAX_KEY_SIZE: usize = 32;
-        const MAX_VALUE_SIZE: usize = 1024;
-
-        if key.len() > MAX_KEY_SIZE {
+        if key.len() > self.config.max_key_size {
             Err(KademliaError::InvalidData(
                 "Key size exceeds maximum allowed",
             ))
-        } else if value.len() > MAX_VALUE_SIZE {
+        } else if value.len() > self.config.max_value_size {
             Err(KademliaError::InvalidData(
                 "Value size exceeds maximum allowed",
             ))
@@ -684,7 +764,7 @@ impl KademliaNode {
     ) -> Result<Message, KademliaError> {
         let message = Message::FindValue { key: key.to_vec() };
         debug!("Sending FIND_VALUE message to {}: {:?}", addr, key);
-        self.network_manager.send_message(&message, addr).await?;
+        self.network_manager.send_message(message, addr).await?;
 
         match tokio::time::timeout(
             self.config.request_timeout,
@@ -709,32 +789,51 @@ impl KademliaNode {
 
     pub async fn ping(&self, addr: SocketAddr) -> Result<(), KademliaError> {
         debug!("Pinging node at {} from {}", addr, self.addr);
-        self.network_manager
-            .send_message(&Message::Ping { sender: self.id }, addr)
-            .await?;
 
-        match tokio::time::timeout(
-            self.config.request_timeout,
-            self.network_manager.receive_message(),
+        // Clone the necessary data to move into the closure
+        let network_manager = self.network_manager.clone();
+        let config = Arc::clone(&self.config);
+        let self_id = self.id;
+        let self_addr = self.addr;
+
+        exponential_backoff(
+            move || {
+                let config_clone = Arc::clone(&self.config);
+                let network_manager = network_manager.clone();
+
+                Box::pin(async move {
+                    network_manager
+                        .send_message(Message::Ping { sender: self_id }, addr)
+                        .await?;
+
+                    match tokio::time::timeout(
+                        config_clone.request_timeout,
+                        network_manager.receive_message(),
+                    )
+                    .await
+                    {
+                        Ok(Ok((Message::Pong { sender }, src))) => {
+                            if KademliaNode::is_same_node(addr, src) {
+                                // Note: This is now a separate function
+                                debug!("Received pong from {:?} at {}", sender, src);
+                                Ok(())
+                            } else {
+                                error!("Unexpected response from {}", src);
+                                Err(KademliaError::UnexpectedResponse)
+                            }
+                        }
+                        Ok(Ok(_)) => Err(KademliaError::UnexpectedResponse),
+                        Ok(Err(e)) => Err(e),
+                        Err(_) => {
+                            warn!("Timeout waiting for pong from {}", addr);
+                            Err(KademliaError::Timeout)
+                        }
+                    }
+                })
+            },
+            3, // Number of retries
         )
         .await
-        {
-            Ok(Ok((Message::Pong { sender }, src))) => {
-                if self.is_same_node(addr, src) {
-                    debug!("Received pong from {:?} at {}", sender, src);
-                    Ok(())
-                } else {
-                    error!("Unexpected response from {}", src);
-                    Err(KademliaError::UnexpectedResponse)
-                }
-            }
-            Ok(Ok(_)) => Err(KademliaError::UnexpectedResponse),
-            Ok(Err(e)) => Err(e),
-            Err(_) => {
-                warn!("Timeout waiting for pong from {}", addr);
-                Err(KademliaError::Timeout)
-            }
-        }
     }
 
     pub async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), KademliaError> {
@@ -794,7 +893,7 @@ impl KademliaNode {
         for (_, addr) in nodes.iter().take(self.config.alpha) {
             debug!("Sending FIND_VALUE request to node at {:?}", addr);
             self.network_manager
-                .send_message(&Message::FindValue { key: key.to_vec() }, *addr)
+                .send_message(Message::FindValue { key: key.to_vec() }, *addr)
                 .await?;
 
             match tokio::time::timeout(
@@ -921,7 +1020,7 @@ impl KademliaNode {
             node_id, addr
         );
         self.network_manager
-            .send_message(&Message::FindNode { target }, addr)
+            .send_message(Message::FindNode { target }, addr)
             .await?;
 
         match tokio::time::timeout(
@@ -962,42 +1061,133 @@ impl KademliaNode {
             "Sending STORE message to {} for key: {:?}, value: {:?}",
             addr, key, value
         );
-        self.network_manager.send_message(&message, addr).await?;
 
-        match tokio::time::timeout(
-            self.config.request_timeout,
-            self.network_manager.receive_message(),
+        // Create new Arcs
+        let net_man = Arc::new(self.network_manager.clone());
+        let cfg = Arc::new(self.config.clone());
+
+        exponential_backoff(
+            move || {
+                let net_man_clone = Arc::clone(&net_man);
+                let cfg_clone = Arc::clone(&cfg);
+                let message_clone = message.clone();
+
+                Box::pin(async move {
+                    net_man_clone.send_message(message_clone, addr).await?;
+
+                    match tokio::time::timeout(
+                        cfg_clone.request_timeout,
+                        net_man_clone.receive_message(),
+                    )
+                    .await
+                    {
+                        Ok(Ok((
+                            Message::StoreResponse {
+                                success,
+                                error_message,
+                            },
+                            _,
+                        ))) => {
+                            if !success {
+                                warn!("Store failed on node {}: {:?}", addr, error_message);
+                            }
+                            Ok(success)
+                        }
+                        Ok(Err(e)) => {
+                            error!("Error receiving STORE response from {}: {:?}", addr, e);
+                            Err(e)
+                        }
+                        Err(_) => {
+                            warn!("Timeout waiting for STORE response from {}", addr);
+                            Err(KademliaError::Timeout)
+                        }
+                        _ => {
+                            error!(
+                                "Unexpected response while waiting for STORE confirmation from {}",
+                                addr
+                            );
+                            Err(KademliaError::UnexpectedResponse)
+                        }
+                    }
+                })
+            },
+            3, // Number of retries
         )
         .await
-        {
-            Ok(Ok((
-                Message::StoreResponse {
-                    success,
-                    error_message,
-                },
-                _,
-            ))) => {
-                if !success {
-                    warn!("Store failed on node {}: {:?}", addr, error_message);
-                }
-                Ok(success)
-            }
-            Ok(Err(e)) => {
-                error!("Error receiving STORE response from {}: {:?}", addr, e);
-                Err(e)
-            }
-            Err(_) => {
-                warn!("Timeout waiting for STORE response from {}", addr);
-                Err(KademliaError::Timeout)
-            }
-            _ => {
-                error!(
-                    "Unexpected response while waiting for STORE confirmation from {}",
-                    addr
-                );
-                Err(KademliaError::UnexpectedResponse)
-            }
-        }
+    }
+
+    pub async fn send_store_message2(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        addr: SocketAddr,
+    ) -> Result<bool, KademliaError> {
+        let message = Message::Store {
+            key: key.to_vec(),
+            value: value.to_vec(),
+            sender: self.id,
+            timestamp: SystemTime::now(),
+        };
+
+        debug!(
+            "Sending STORE message to {} for key: {:?}, value: {:?}",
+            addr, key, value
+        );
+
+        let net_man = self.network_manager.clone();
+
+        let cfg = self.config.clone();
+
+        let message_clone = message.clone();
+
+        exponential_backoff(
+            || {
+                let net_man_clone = net_man.clone();
+                let cfg_clone = cfg.clone();
+                let message_clone2 = message_clone.clone();
+
+                Box::pin(async move {
+                    net_man_clone.send_message(message_clone2, addr).await?;
+
+                    match tokio::time::timeout(
+                        cfg_clone.request_timeout,
+                        net_man_clone.receive_message(),
+                    )
+                    .await
+                    {
+                        Ok(Ok((
+                            Message::StoreResponse {
+                                success,
+                                error_message,
+                            },
+                            _,
+                        ))) => {
+                            if !success {
+                                warn!("Store failed on node {}: {:?}", addr, error_message);
+                            }
+                            Ok(success)
+                        }
+                        Ok(Err(e)) => {
+                            error!("Error receiving STORE response from {}: {:?}", addr, e);
+                            Err(e)
+                        }
+                        Err(_) => {
+                            warn!("Timeout waiting for STORE response from {}", addr);
+                            Err(KademliaError::Timeout)
+                        }
+                        _ => {
+                            error!(
+                                "Unexpected response while waiting for STORE confirmation from {}",
+                                addr
+                            );
+                            Err(KademliaError::UnexpectedResponse)
+                        }
+                    }
+                })
+            },
+            3, // Number of retries
+        )
+        .await
     }
 
     // Methods for state inspection
@@ -1013,7 +1203,8 @@ impl KademliaNode {
     }
 
     pub async fn get_storage_size(&self) -> usize {
-        let size = self.storage_manager.storage.len();
+        let storage = self.storage_manager.storage.read().await;
+        let size = storage.len();
         debug!("Local storage size: {}", size);
         size
     }

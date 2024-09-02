@@ -216,7 +216,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Node2 error: {:?}", e);
         }
     });
-d
+
     sleep(Duration::from_secs(1)).await;
 
     // Node 3

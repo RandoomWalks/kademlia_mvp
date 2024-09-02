@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::time::SystemTime;
 
 /// Enum representing different types of messages exchanged in the network.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Message {
     Ping {
         sender: NodeId,

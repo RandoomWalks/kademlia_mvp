@@ -28,6 +28,7 @@ pub enum KademliaError {
     UnexpectedResponse,
     InvalidData(&'static str),
     InvalidMessage,
+    BootstrapFailed,
 }
 
 impl From<std::io::Error> for KademliaError {
@@ -58,6 +59,7 @@ impl fmt::Display for KademliaError {
             KademliaError::UnexpectedResponse => write!(f, "Unexpected response received"),
             KademliaError::InvalidData(msg) => write!(f, "Invalid data: {}", msg),
             KademliaError::InvalidMessage => write!(f, "Invalid message"),
+            KademliaError::BootstrapFailed => write!(f, "BootstrapFailed"),
         }
     }
 }
@@ -244,25 +246,34 @@ impl NetworkManager {
 
 
 // Configuration
-#[derive(Clone, Debug)]
-pub struct Config {
-    pub k: usize,
+#[derive(Clone, Debug)]pub struct Config {
+    // Existing fields
     pub alpha: usize,
-    pub request_timeout: Duration,
+    pub k: usize,
     pub cache_size: usize,
     pub cache_ttl: Duration,
     pub maintenance_interval: Duration,
+    pub request_timeout: Duration,
+    
+    // New fields
+    pub max_key_size: usize,
+    pub max_value_size: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
-            k: 20,
-            alpha: 3,
-            request_timeout: Duration::from_secs(5),
+            // Default values for existing fields
+            alpha: ALPHA,
+            k: K,
             cache_size: 1000,
-            cache_ttl: Duration::from_secs(3600),
-            maintenance_interval: Duration::from_secs(3600),
+            cache_ttl: Duration::from_secs(300),
+            maintenance_interval: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(5),
+            
+            // Default values for new fields
+            max_key_size: 32,
+            max_value_size: 1024,
         }
     }
 }
