@@ -1,6 +1,7 @@
 use crate::cache::cache_impl;
 use crate::cache::entry;
 use crate::cache::policy;
+use crate::message;
 use crate::message::{FindValueResult, Message};
 use crate::routing_table::RoutingTable;
 use crate::utils::{KademliaError, NodeId};
@@ -55,6 +56,7 @@ where
 }
 
 // Network Manager
+#[derive(Clone)]
 pub struct NetworkManager {
     pub socket: Arc<UdpSocket>,
     pub config: Arc<Config>,
@@ -81,17 +83,22 @@ impl NetworkManager {
 
     pub async fn send_message(
         &self,
-        message: &Message,
+        message: Message,
         dst: SocketAddr,
     ) -> Result<(), KademliaError> {
         debug!("Sending message to {}: {:?}", dst, message);
 
+        let message = Arc::new(message);
+
         exponential_backoff(
             || {
-                let message = message.clone();
+                let message_clone = message.clone();
+
                 let socket = Arc::clone(&self.socket);
+
                 Box::pin(async move {
-                    let serialized = bincode::serialize(&message)?;
+                    let serialized = bincode::serialize(&*message_clone)?;
+                    /// Serializes a serializable object into a `Vec` of bytes using the default configuration.
                     socket
                         .send_to(&serialized, dst)
                         .await
@@ -100,7 +107,7 @@ impl NetworkManager {
                             error!("Failed to send message to {}: {:?}", dst, e);
                             KademliaError::Network(e)
                         })
-                }) as Pin<Box<dyn Future<Output = Result<(), KademliaError>>>>
+                })
             },
             3, // Number of retries
         )
@@ -108,17 +115,24 @@ impl NetworkManager {
     }
 
     pub async fn receive_message(&self) -> Result<(Message, SocketAddr), KademliaError> {
-        let socket = Arc::clone(&self.socket);
+        let socket_clone = Arc::clone(&self.socket);
+
         exponential_backoff(
             move || {
+                let socket_clone = Arc::clone(&socket_clone); // Clone here
+
                 Box::pin(async move {
                     let mut buf = vec![0u8; 1024];
-                    let (size, src) = socket.recv_from(&mut buf).await.map_err(|e| {
+
+                    let (size, src) = socket_clone.recv_from(&mut buf).await.map_err(|e| {
                         error!("Failed to receive message: {:?}", e);
                         KademliaError::Network(e)
                     })?;
+
                     let message: Message = bincode::deserialize(&buf[..size])?;
+
                     debug!("Received message from {}: {:?}", src, message);
+
                     Ok((message, src))
                 })
                     as Pin<Box<dyn Future<Output = Result<(Message, SocketAddr), KademliaError>>>>
@@ -285,7 +299,7 @@ impl KademliaNode {
         ))
     }
 
-    fn is_same_node(&self, addr1: SocketAddr, addr2: SocketAddr) -> bool {
+    fn is_same_node(addr1: SocketAddr, addr2: SocketAddr) -> bool {
         if addr1 == addr2 {
             return true;
         }
@@ -408,7 +422,8 @@ impl KademliaNode {
                 warn!("No bootstrap nodes responded. Retrying the bootstrap process after delay.");
                 sleep(retry_delay).await;
                 retry_delay *= 2; // Exponential increase of retry delay
-                retry_count += 1;            }
+                retry_count += 1;
+            }
         }
     }
 
@@ -486,7 +501,7 @@ impl KademliaNode {
         );
 
         self.network_manager
-            .send_message(&Message::Pong { sender: self.id }, src)
+            .send_message(Message::Pong { sender: self.id }, src)
             .await
     }
 
@@ -510,7 +525,7 @@ impl KademliaNode {
 
         self.network_manager
             .send_message(
-                &Message::StoreResponse {
+                Message::StoreResponse {
                     success: true,
                     error_message: None,
                 },
@@ -533,7 +548,7 @@ impl KademliaNode {
         );
 
         let response = Message::NodesFound(closest_nodes);
-        self.network_manager.send_message(&response, src).await
+        self.network_manager.send_message(response, src).await
     }
 
     pub async fn handle_find_value(
@@ -546,7 +561,7 @@ impl KademliaNode {
             FindValueResult::Value(value) => {
                 debug!("Value found locally for key: {:?}", key);
                 self.network_manager
-                    .send_message(&Message::ValueFound(value), src)
+                    .send_message(Message::ValueFound(value), src)
                     .await
             }
             FindValueResult::Nodes(nodes) => {
@@ -555,7 +570,7 @@ impl KademliaNode {
                     key
                 );
                 self.network_manager
-                    .send_message(&Message::NodesFound(nodes), src)
+                    .send_message(Message::NodesFound(nodes), src)
                     .await
             }
         }
@@ -656,7 +671,7 @@ impl KademliaNode {
             success,
             error_message,
         };
-        self.network_manager.send_message(&response, dst).await
+        self.network_manager.send_message(response, dst).await
     }
 
     pub async fn send_client_get_response(
@@ -673,7 +688,7 @@ impl KademliaNode {
             value,
             error_message,
         };
-        self.network_manager.send_message(&response, dst).await
+        self.network_manager.send_message(response, dst).await
     }
 
     fn validate_key_value(&self, key: &[u8], value: &[u8]) -> Result<(), KademliaError> {
@@ -749,7 +764,7 @@ impl KademliaNode {
     ) -> Result<Message, KademliaError> {
         let message = Message::FindValue { key: key.to_vec() };
         debug!("Sending FIND_VALUE message to {}: {:?}", addr, key);
-        self.network_manager.send_message(&message, addr).await?;
+        self.network_manager.send_message(message, addr).await?;
 
         match tokio::time::timeout(
             self.config.request_timeout,
@@ -775,21 +790,31 @@ impl KademliaNode {
     pub async fn ping(&self, addr: SocketAddr) -> Result<(), KademliaError> {
         debug!("Pinging node at {} from {}", addr, self.addr);
 
+        // Clone the necessary data to move into the closure
+        let network_manager = self.network_manager.clone();
+        let config = Arc::clone(&self.config);
+        let self_id = self.id;
+        let self_addr = self.addr;
+
         exponential_backoff(
-            || {
+            move || {
+                let config_clone = Arc::clone(&self.config);
+                let network_manager = network_manager.clone();
+
                 Box::pin(async move {
-                    self.network_manager
-                        .send_message(&Message::Ping { sender: self.id }, addr)
+                    network_manager
+                        .send_message(Message::Ping { sender: self_id }, addr)
                         .await?;
 
                     match tokio::time::timeout(
-                        self.config.request_timeout,
-                        self.network_manager.receive_message(),
+                        config_clone.request_timeout,
+                        network_manager.receive_message(),
                     )
                     .await
                     {
                         Ok(Ok((Message::Pong { sender }, src))) => {
-                            if self.is_same_node(addr, src) {
+                            if KademliaNode::is_same_node(addr, src) {
+                                // Note: This is now a separate function
                                 debug!("Received pong from {:?} at {}", sender, src);
                                 Ok(())
                             } else {
@@ -868,7 +893,7 @@ impl KademliaNode {
         for (_, addr) in nodes.iter().take(self.config.alpha) {
             debug!("Sending FIND_VALUE request to node at {:?}", addr);
             self.network_manager
-                .send_message(&Message::FindValue { key: key.to_vec() }, *addr)
+                .send_message(Message::FindValue { key: key.to_vec() }, *addr)
                 .await?;
 
             match tokio::time::timeout(
@@ -995,7 +1020,7 @@ impl KademliaNode {
             node_id, addr
         );
         self.network_manager
-            .send_message(&Message::FindNode { target }, addr)
+            .send_message(Message::FindNode { target }, addr)
             .await?;
 
         match tokio::time::timeout(
@@ -1037,14 +1062,96 @@ impl KademliaNode {
             addr, key, value
         );
 
+        // Create new Arcs
+        let net_man = Arc::new(self.network_manager.clone());
+        let cfg = Arc::new(self.config.clone());
+
         exponential_backoff(
-            || {
+            move || {
+                let net_man_clone = Arc::clone(&net_man);
+                let cfg_clone = Arc::clone(&cfg);
+                let message_clone = message.clone();
+
                 Box::pin(async move {
-                    self.network_manager.send_message(&message, addr).await?;
+                    net_man_clone.send_message(message_clone, addr).await?;
 
                     match tokio::time::timeout(
-                        self.config.request_timeout,
-                        self.network_manager.receive_message(),
+                        cfg_clone.request_timeout,
+                        net_man_clone.receive_message(),
+                    )
+                    .await
+                    {
+                        Ok(Ok((
+                            Message::StoreResponse {
+                                success,
+                                error_message,
+                            },
+                            _,
+                        ))) => {
+                            if !success {
+                                warn!("Store failed on node {}: {:?}", addr, error_message);
+                            }
+                            Ok(success)
+                        }
+                        Ok(Err(e)) => {
+                            error!("Error receiving STORE response from {}: {:?}", addr, e);
+                            Err(e)
+                        }
+                        Err(_) => {
+                            warn!("Timeout waiting for STORE response from {}", addr);
+                            Err(KademliaError::Timeout)
+                        }
+                        _ => {
+                            error!(
+                                "Unexpected response while waiting for STORE confirmation from {}",
+                                addr
+                            );
+                            Err(KademliaError::UnexpectedResponse)
+                        }
+                    }
+                })
+            },
+            3, // Number of retries
+        )
+        .await
+    }
+
+    pub async fn send_store_message2(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        addr: SocketAddr,
+    ) -> Result<bool, KademliaError> {
+        let message = Message::Store {
+            key: key.to_vec(),
+            value: value.to_vec(),
+            sender: self.id,
+            timestamp: SystemTime::now(),
+        };
+
+        debug!(
+            "Sending STORE message to {} for key: {:?}, value: {:?}",
+            addr, key, value
+        );
+
+        let net_man = self.network_manager.clone();
+
+        let cfg = self.config.clone();
+
+        let message_clone = message.clone();
+
+        exponential_backoff(
+            || {
+                let net_man_clone = net_man.clone();
+                let cfg_clone = cfg.clone();
+                let message_clone2 = message_clone.clone();
+
+                Box::pin(async move {
+                    net_man_clone.send_message(message_clone2, addr).await?;
+
+                    match tokio::time::timeout(
+                        cfg_clone.request_timeout,
+                        net_man_clone.receive_message(),
                     )
                     .await
                     {

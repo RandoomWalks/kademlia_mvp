@@ -59,6 +59,7 @@ impl fmt::Display for KademliaError {
             KademliaError::UnexpectedResponse => write!(f, "Unexpected response received"),
             KademliaError::InvalidData(msg) => write!(f, "Invalid data: {}", msg),
             KademliaError::InvalidMessage => write!(f, "Invalid message"),
+            KademliaError::BootstrapFailed => write!(f, "BootstrapFailed"),
         }
     }
 }
