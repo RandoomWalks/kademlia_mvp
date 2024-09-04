@@ -376,19 +376,12 @@ liaNode  |
 ### Project Structure
 
 ```
-.
-├── .gitignore
-├── Cargo.lock
-├── Cargo.toml
-├── README.md
-├── src
-│   ├── lib.rs
-│   └── main.rs
-├── tests
-│   └── test1.rs
-└── test_snapshot_thread.json
+src/
+├── main.rs
+├── node.rs
+├── kbucket.rs
+├── routing_table.rs
+├── message.rs
+└── utils.rs
 ```
 
-- **src/main.rs**: Contains the main entry point of the application.
-- **src/lib.rs**: Contains the core logic of the Kademlia implementation.
-- **tests/test1.rs**: Contains the test cases for the Kademlia implementation.
